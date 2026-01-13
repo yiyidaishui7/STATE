@@ -1,0 +1,5 @@
+nohup: ignoring input
+==========================================
+Baseline训练 - 严格Zero-shot
+==========================================
+./scripts/run_baseline.sh: line 27: cd: /home/s125mdg34_03/state: No such file or directory

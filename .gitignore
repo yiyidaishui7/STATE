@@ -1,0 +1,70 @@
+.vscode/
+hostfile
+__pycache__/
+vci_job_*
+lightning_logs/
+outputs/
+log/
+uv.lock
+tmp/
+notebooks/
+*.sif
+*.slurm
+temp
+wandb/
+# --- 忽略系统和环境文件 ---
+__pycache__/
+*.py[cod]
+.DS_Store
+.vscode/
+.idea/
+.env/
+venv/
+
+# --- 忽略大文件 (根据你的后缀名添加) ---
+*.pth
+*.ckpt
+*.model
+*.h5
+*.tar.gz
+*.zip
+*.rar
+*.h5ad
+*.pt
+*.pkl
+# --- 关于 CSV 的特殊处理 ---
+# 如果你想上传 CSV，就不要在这里写 *.csv
+# 但如果某些 CSV 特别大（超过100MB），你需要单独忽略它，例如：
+# huge_dataset.csv
+*.csv
+# --- 忽略日志和输出目录 ---
+logs/
+output/
+runs/
+# --- 忽略系统/环境 ---
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- 忽略巨大的数据和结果文件夹 (根据你的列表) ---
+competition/
+competition_*/
+baseline/
+baseline2/
+batch_results/
+cell-eval-outdir/
+official-result/
+wandb/
+wandb_logs/
+assets/
+
+# --- 忽略常见的模型权重和压缩包 ---
+*.pth
+*.ckpt
+*.bin
+*.tar.gz
+*.zip
+

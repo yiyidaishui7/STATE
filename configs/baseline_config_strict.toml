@@ -1,0 +1,22 @@
+# Baseline Configuration - 严格的Zero-shot设置
+# 训练集：K562 + Jurkat + RPE1 (完全排除HepG2)
+# 验证集：HepG2 (完全)
+# 测试集：H1 (如果有的话)
+
+[datasets]
+# 训练数据：只包含K562, Jurkat, RPE1
+replogle_train = "competition_support_set/{k562,jurkat,rpe1}.h5"
+# 验证/测试数据：HepG2和H1（如果存在）
+replogle_eval = "competition_support_set/hepg2.h5"
+
+[training]
+# 只有train数据用于训练
+replogle_train = "train"
+replogle_eval = "val"  # HepG2全部作为验证集
+
+[zeroshot]
+"replogle_eval" = "val"
+
+[fewshot]
+# 不需要fewshot配置
+

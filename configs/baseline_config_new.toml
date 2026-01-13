@@ -1,0 +1,37 @@
+# Dataset paths - maps dataset names to their directories
+[datasets]
+replogle_h1 = "competition_support_set/{competition_train,rpe1,jurkat,k562,hepg2}.h5"
+
+# Training specifications
+# All cell types in a dataset automatically go into training (excluding zeroshot/fewshot overrides)
+[training]
+replogle_h1 = "train"
+
+# Zeroshot specifications - entire cell types go to val or test
+[zeroshot]
+"replogle_h1.hepg2" = "val"
+
+
+# Fewshot specifications - explicit perturbation lists
+[fewshot]
+
+
+# [datasets]
+# train_data = [
+#     "competition_support_set/k562.h5",
+#     "competition_support_set/jurkat.h5"
+# ]
+
+# val_data = "competition_support_set/hepg2.h5"
+
+# test_data = "competition_support_set/rpe1.h5"
+
+# [training]
+# train_data = "train"
+# val_data = "val"
+# test_data = "test"
+
+# [zeroshot]
+# # 不需要 - 已经物理分离
+
+# [fewshot]
