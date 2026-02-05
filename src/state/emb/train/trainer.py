@@ -21,7 +21,38 @@ from ..train.callbacks import (
     CumulativeFLOPSCallback,
 )
 from ..utils import get_latest_checkpoint, get_embedding_cfg, get_dataset_cfg
+from src.state.emb.data.sampler import DomainBalancedSampler
 
+# [0205新增代码begin] 
+import copy
+
+class ParallelZipLoader:
+    """
+    并行混合加载器：模拟架构图中的 'Input Layer'。
+    它不合并数据，只是在迭代时同时从三个 Loader 中各取一个 Batch。
+    返回格式: (batch_k562, batch_rpe1, batch_jurkat)
+    """
+    def __init__(self, loaders):
+        self.loaders = loaders
+    
+    def __iter__(self):
+        # 使用 zip 将三个迭代器并行
+        return zip(*self.loaders)
+    
+    def __len__(self):
+        # 长度以最短的那个 Loader 为准 (木桶效应)
+        return min(len(l) for l in self.loaders)
+
+    @property
+    def batch_size(self):
+        # 为了兼容部分日志打印逻辑，返回总大小
+        return sum(l.batch_size for l in self.loaders)
+    
+    @property
+    def num_workers(self):
+        return self.loaders[0].num_workers
+
+# [0205新增代码end] 
 
 def get_embeddings(cfg):
     # Load in ESM2 embeddings and special tokens
@@ -53,21 +84,71 @@ def main(cfg):
     if get_dataset_cfg(cfg).ds_type == "h5ad":
         DatasetClass = H5adSentenceDataset
     else:
-        raise ValueError(f"Unknown dataset type: {get_dataset_cfg(cfg).ds_type}")
+        raise ValueError(f"Unknown dataset type: {get_dataset_cfg(cfg).ds_type}")\
+        
+# 0205 [替换原有 train_dataloader 初始化代码] ==============================
+    
+    # 1. 定义三个细胞系的数据源路径
+    # 请务必修改为你实际的文件路径
+    domain_configs = [
+        {"name": "K562",   "path": "state/competition_support_set/k562.h5ad"},  
+        {"name": "RPE1",   "path": "state/competition_support_set/rpe1.h5ad"},
+        {"name": "Jurkat", "path": "state/competition_support_set/jurkat.h5"}
+    ]
 
-    # Training dataloader
-    train_dataset = DatasetClass(cfg)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=cfg.model.batch_size,
-        shuffle=True,
-        collate_fn=train_dataset_sentence_collator,
-        num_workers=cfg.dataset.num_train_workers,
-        persistent_workers=True,
-        pin_memory=True,
-        prefetch_factor=4,
-        generator=generator,
-    )
+    parallel_loaders = []
+    print(f"\n[MMD-AAE Init] 开始初始化 3 路并行 DataLoaders...")
+
+    for domain in domain_configs:
+        # 1. 克隆配置，避免相互污染
+        dom_cfg = copy.deepcopy(cfg)
+        
+        # 2. 强制指向特定的 h5ad 文件
+        # 注意：这里假设 DatasetClass 读取的是 cfg.dataset.data_path
+        # 如果你的 config 结构不同，请对应修改这里的 key
+        dom_cfg.dataset.data_path = domain["path"] 
+        # 如果原代码用的是 data_dir，请改为: dom_cfg.dataset.data_dir = ...
+        
+        # 3. 实例化 Dataset
+        dom_dataset = DatasetClass(dom_cfg)
+        
+        # 4. 实例化 Loader
+        # 关键参数：
+        # batch_size=32: 确保总 batch 为 96 (32*3)
+        # drop_last=True: 必须开启，防止尾部数据对不齐导致 zip 报错
+        loader = DataLoader(
+            dom_dataset,
+            batch_size=32, 
+            shuffle=True,  
+            collate_fn=train_dataset_sentence_collator,
+            num_workers=2, 
+            persistent_workers=True,
+            pin_memory=True,
+            drop_last=True 
+        )
+        parallel_loaders.append(loader)
+        print(f"  -> {domain['name']} Loader Ready. Size: {len(dom_dataset)}")
+
+    # 5. 封装成并行加载器
+    train_dataloader = ParallelZipLoader(parallel_loaders)
+    print(f"[MMD-AAE Init] 并行加载器构建完成。总 Batch Size: {train_dataloader.batch_size}\n")
+    
+    # [替换结束] ========================================================
+    # # 原Training dataloader
+    # train_dataset = DatasetClass(cfg)
+    # train_dataloader = DataLoader(
+    #     train_dataset,
+    #     batch_size=cfg.model.batch_size,
+    #     shuffle=True,
+    #     collate_fn=train_dataset_sentence_collator,
+    #     num_workers=cfg.dataset.num_train_workers,
+    #     persistent_workers=True,
+    #     pin_memory=True,
+    #     prefetch_factor=4,
+    #     generator=generator,
+    # )
+
+
 
     val_dataset = DatasetClass(cfg, test=True)
     val_dataloader = DataLoader(
@@ -178,7 +259,28 @@ def main(cfg):
         print(f"******** Loading chkpoint {run_name} {chk}...")
     else:
         print(f"******** Initialized fresh {run_name}...")
-
+# [临时验证代码：确认数据格式]
+    print("="*30)
+    print("正在验证 DataLoader 输出格式...")
+    
+    # 手动取一个 Batch 看看
+    test_batch = next(iter(train_dataloader))
+    
+    print(f"Batch 类型: {type(test_batch)}") # 应该输出 <class 'tuple'>
+    print(f"Batch 长度: {len(test_batch)}") # 应该输出 3
+    
+    # 检查第一个细胞系的数据 (K562)
+    k562_data = test_batch[0]
+    # 假设 Dataset 返回的是字典，打印 keys 确认
+    if isinstance(k562_data, dict):
+        print(f"K562 Keys: {k562_data.keys()}")
+        if 'genes' in k562_data:
+            print(f"K562 Genes Shape: {k562_data['genes'].shape}") # 预期: [32, gene_dim]
+    
+    print("验证通过！DataLoader 已成功并行化。")
+    print("="*30)
+    exit() # 验证完可以取消注释这行直接退出，不跑后面的报错
+    
     trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=chk)
 
     trainer.save_checkpoint(os.path.join(cfg.experiment.checkpoint.path, f"{run_name}_final.pt"))

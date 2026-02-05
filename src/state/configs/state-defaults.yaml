@@ -224,6 +224,8 @@ model:
   batch_tabular_loss: false
   num_downsample: 1
   variable_masking: true
+  # ... 其他设置 ...
+  use_domain_balanced_sampler: True  # <--- 加上这一行，设为 True 开启
 task:
   mask: 0.2
 optimizer:

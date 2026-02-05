@@ -5,11 +5,15 @@ import torch.utils.data as data
 import torch.nn.functional as F
 import functools
 import numpy as np
+import pandas as pd
+import scanpy as sc
+from tqdm import tqdm
 
 from typing import Dict, Optional
 
 from torch.utils.data import DataLoader
 from .. import utils
+from src.state.emb.data.sampler import DomainBalancedSampler
 
 log = logging.getLogger(__file__)
 
@@ -17,7 +21,6 @@ log = logging.getLogger(__file__)
 EXPONENTIATED_UMIS_LIMIT = 5_000_000
 # If any count exceeds this, we confidently treat the tensor as raw integers
 RAW_COUNT_HEURISTIC_THRESHOLD = 35
-
 
 # THIS SHOULD ONLY BE USED FOR INFERENCE
 def create_dataloader(
@@ -78,7 +81,7 @@ def create_dataloader(
     )
     return dataloader
 
-
+    
 class H5adSentenceDataset(data.Dataset):
     def __init__(self, cfg, test=False, datasets=None, shape_dict=None, adata=None, adata_name=None) -> None:
         super(H5adSentenceDataset, self).__init__()
@@ -183,6 +186,49 @@ class H5adSentenceDataset(data.Dataset):
     def get_dim(self) -> Dict[str, int]:
         return self.num_genes
 
+
+    # === 【新增代码 2/2】: 实现元数据加载逻辑 ===
+    def _load_all_metadata(self):
+        """
+        遍历所有子数据集，只读取 .obs，拼接成全局 Metadata
+        注意：拼接顺序必须与 self.datasets 列表顺序严格一致，
+        否则 Sampler 生成的索引会错位！
+        """
+        meta_list = []
+        
+        # self.datasets 是排序过的 dataset name 列表
+        # 必须按这个顺序读取，才能保证索引对齐
+        for ds_name in tqdm(self.datasets, desc="Reading .obs"):
+            file_path = self.dataset_path_map[ds_name]
+            
+            # 使用 backed='r' 模式，只读元数据，不加载表达量矩阵，速度很快且不爆内存
+            try:
+                adata = sc.read_h5ad(file_path, backed='r')
+                
+                # 提取关键列。请确认你的 h5ad 里列名是不是 'cell_type' 和 'perturbation'
+                # 有些数据集可能是 'cell_line', 'condition' 等，需在此处做映射
+                if 'cell_type' not in adata.obs.columns or 'perturbation' not in adata.obs.columns:
+                    print(f"Warning: {ds_name} missing required columns. Skipping validation check.")
+                    # 容错处理：如果列名不对，这里需要你手动修正，或者创建一个 dummy df
+                    # 这里假设列名是对的
+                
+                # 只取需要的列，节省内存
+                df = adata.obs[['cell_type', 'perturbation']].copy()
+                
+                # 统一列名（如果你的数据源列名不统一，在这里 rename）
+                # df.rename(columns={'cell_line': 'cell_type', 'drug': 'perturbation'}, inplace=True)
+                
+                meta_list.append(df)
+                
+            except Exception as e:
+                print(f"Error reading metadata from {ds_name}: {e}")
+                raise e
+
+        # 拼接成一个巨大的 DataFrame
+        full_meta = pd.concat(meta_list, ignore_index=True)
+        print(f"[Dataset] Metadata loaded. Total samples: {len(full_meta)}")
+        return full_meta
+    
 
 class FilteredGenesCounts(H5adSentenceDataset):
     def __init__(
