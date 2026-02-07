@@ -59,30 +59,47 @@ def load_sample_data(h5_path, num_samples=3):
         print(f"\n  数据矩阵信息:")
         
         if 'X' in f:
-            x_group = f['X']
-            attrs = dict(x_group.attrs) if hasattr(x_group, 'attrs') else {}
-            print(f"    编码类型: {attrs.get('encoding-type', 'unknown')}")
+            x_item = f['X']
             
-            if 'data' in x_group:
-                print(f"    data shape: {x_group['data'].shape}")
-            if 'indices' in x_group:
-                print(f"    indices shape: {x_group['indices'].shape}")
-            if 'indptr' in x_group:
-                indptr = x_group['indptr'][:]
-                num_cells = len(indptr) - 1
+            # 检查是密集矩阵还是稀疏矩阵
+            if isinstance(x_item, h5py.Dataset):
+                # 密集矩阵格式
+                num_cells, num_genes = x_item.shape
+                print(f"    格式: 密集矩阵 (Dense)")
+                print(f"    形状: {x_item.shape}")
+                print(f"    数据类型: {x_item.dtype}")
                 print(f"    细胞数量: {num_cells}")
+                print(f"    基因数量: {num_genes}")
                 
                 # 读取前几个细胞的数据
                 print(f"\n  前 {num_samples} 个细胞的信息:")
                 for i in range(min(num_samples, num_cells)):
-                    start = indptr[i]
-                    end = indptr[i+1]
-                    nnz = end - start  # 非零基因数
-                    if nnz > 0:
-                        sample_data = x_group['data'][start:min(start+5, end)]
-                        print(f"    Cell {i}: 非零基因数={nnz}, 前5个值={sample_data}")
-                    else:
-                        print(f"    Cell {i}: 非零基因数=0")
+                    cell_data = x_item[i, :]
+                    nnz = np.sum(cell_data > 0)
+                    mean_val = np.mean(cell_data)
+                    max_val = np.max(cell_data)
+                    print(f"    Cell {i}: 非零基因数={nnz}, mean={mean_val:.4f}, max={max_val:.4f}")
+                
+                return num_cells
+                
+            elif isinstance(x_item, h5py.Group):
+                # 稀疏矩阵格式 (CSR)
+                attrs = dict(x_item.attrs) if hasattr(x_item, 'attrs') else {}
+                print(f"    格式: 稀疏矩阵 ({attrs.get('encoding-type', 'unknown')})")
+                
+                if 'indptr' in x_item:
+                    indptr = x_item['indptr'][:]
+                    num_cells = len(indptr) - 1
+                    print(f"    细胞数量: {num_cells}")
+                    
+                    print(f"\n  前 {num_samples} 个细胞的信息:")
+                    for i in range(min(num_samples, num_cells)):
+                        start = indptr[i]
+                        end = indptr[i+1]
+                        nnz = end - start
+                        print(f"    Cell {i}: 非零基因数={nnz}")
+                    
+                    return num_cells
         
         # 检查 obs (细胞元数据)
         if 'obs' in f:
@@ -93,7 +110,12 @@ def load_sample_data(h5_path, num_samples=3):
                 if isinstance(item, h5py.Dataset):
                     print(f"    {key}: shape={item.shape}")
                 elif isinstance(item, h5py.Group):
-                    print(f"    {key}: Group")
+                    # 检查是否是 categorical 类型
+                    if 'categories' in item:
+                        cats = item['categories']
+                        print(f"    {key}: Categorical ({len(cats)} categories)")
+                    else:
+                        print(f"    {key}: Group")
         
         # 检查 var (基因元数据)
         if 'var' in f:
@@ -104,15 +126,11 @@ def load_sample_data(h5_path, num_samples=3):
                 if isinstance(item, h5py.Dataset):
                     if item.shape:
                         print(f"    {key}: shape={item.shape}")
-                        # 尝试读取前几个基因名
-                        if 'gene' in key.lower() or key == '_index':
-                            try:
-                                sample = item[:3]
-                                if hasattr(sample[0], 'decode'):
-                                    sample = [s.decode('utf-8') for s in sample]
-                                print(f"      示例: {sample}")
-                            except:
-                                pass
+                elif isinstance(item, h5py.Group):
+                    if 'categories' in item:
+                        print(f"    {key}: Categorical")
+        
+        return None
 
 def main():
     print("\n[Step 1] 检查数据文件...")
@@ -149,15 +167,13 @@ def main():
                 structure = explore_h5_structure(f)
                 print_h5_structure(structure)
                 
-                # 获取细胞和基因数量
-                if 'X' in f and 'indptr' in f['X']:
-                    num_cells = len(f['X']['indptr'][:]) - 1
-                    domain_info[name] = {'cells': num_cells, 'path': path}
-                    print(f"\n  ✓ 细胞数量: {num_cells}")
-                
-            # 加载样本数据
-            load_sample_data(path)
-            print(f"\n  ✓ 文件读取成功!")
+            # 加载样本数据并获取细胞数
+            num_cells = load_sample_data(path)
+            if num_cells:
+                domain_info[name] = {'cells': num_cells, 'path': path}
+                print(f"\n  ✓ 文件读取成功!")
+            else:
+                print(f"\n  ⚠️ 无法确定细胞数量")
             
         except Exception as e:
             print(f"\n  ✗ 读取失败: {e}")
