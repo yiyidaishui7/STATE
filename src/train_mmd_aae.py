@@ -98,24 +98,36 @@ class ParallelZipLoader:
 # MMD-AAE 模型 (内联定义，避免导入问题)
 # ============================================================================
 
-def compute_mmd_rbf(x, y, sigma=1.0):
-    """计算 RBF 核 MMD"""
+def compute_mmd_multi_kernel(x, y):
+    """
+    使用多核 MMD (多个 sigma 值的 RBF 核)
+    这种方法对不同尺度的分布差异更鲁棒
+    """
+    # 多个尺度的 sigma
+    sigmas = [0.01, 0.1, 1.0, 10.0, 100.0]
+    
+    # 计算成对距离
     xx = torch.mm(x, x.t())
     yy = torch.mm(y, y.t())
     xy = torch.mm(x, y.t())
     
-    rx = (xx.diag().unsqueeze(0).expand_as(xx))
-    ry = (yy.diag().unsqueeze(0).expand_as(yy))
+    rx = xx.diag().unsqueeze(0).expand_as(xx)
+    ry = yy.diag().unsqueeze(0).expand_as(yy)
     
-    dxx = rx.t() + rx - 2. * xx
-    dyy = ry.t() + ry - 2. * yy
-    dxy = rx.t() + ry - 2. * xy
+    dxx = rx.t() + rx - 2. * xx  # (N, N)
+    dyy = ry.t() + ry - 2. * yy  # (M, M)
+    dxy = rx.t().expand(x.size(0), y.size(0)) + ry.expand(x.size(0), y.size(0)) - 2. * xy  # (N, M)
     
-    XX = torch.exp(-0.5 * dxx / sigma)
-    YY = torch.exp(-0.5 * dyy / sigma)
-    XY = torch.exp(-0.5 * dxy / sigma)
+    mmd = x.new_zeros(1)  # 保持梯度连接！
     
-    return XX.mean() + YY.mean() - 2. * XY.mean()
+    for sigma in sigmas:
+        gamma = 1.0 / (2 * sigma ** 2)
+        XX = torch.exp(-gamma * dxx)
+        YY = torch.exp(-gamma * dyy)
+        XY = torch.exp(-gamma * dxy)
+        mmd = mmd + XX.mean() + YY.mean() - 2. * XY.mean()
+    
+    return mmd / len(sigmas)
 
 
 class Encoder(nn.Module):
@@ -199,24 +211,26 @@ class MMD_AAE(nn.Module):
         domain_logits = self.discriminator(z)
         return x_recon, z, domain_logits
     
-    def compute_loss(self, x, domain_labels, weight_recon=1.0, weight_mmd=0.5, weight_adv=0.1, grl_alpha=1.0):
+    def compute_loss(self, x, domain_labels, weight_recon=1.0, weight_mmd=1.0, weight_adv=0.1, grl_alpha=1.0):
         x_recon, z, _ = self.forward(x)
         
         # 1. 重建损失
         recon_loss = nn.functional.mse_loss(x_recon, x)
         
-        # 2. MMD 损失
-        mmd_loss = torch.tensor(0.0, device=x.device)
-        pair_count = 0
+        # 2. MMD 损失 - 使用 z 来初始化，保持梯度连接
+        mmd_losses = []
         for i in range(self.num_domains):
             for j in range(i + 1, self.num_domains):
                 mask_i = domain_labels == i
                 mask_j = domain_labels == j
                 if mask_i.sum() > 1 and mask_j.sum() > 1:
-                    mmd_loss = mmd_loss + compute_mmd_rbf(z[mask_i], z[mask_j])
-                    pair_count += 1
-        if pair_count > 0:
-            mmd_loss = mmd_loss / pair_count
+                    mmd_ij = compute_mmd_multi_kernel(z[mask_i], z[mask_j])
+                    mmd_losses.append(mmd_ij)
+        
+        if len(mmd_losses) > 0:
+            mmd_loss = torch.stack(mmd_losses).mean()
+        else:
+            mmd_loss = z.new_zeros(1).squeeze()
         
         # 3. 对抗损失 (使用梯度反转)
         z_grl = GradientReversalFunction.apply(z, grl_alpha)
@@ -232,6 +246,7 @@ class MMD_AAE(nn.Module):
             'mmd': mmd_loss,
             'adv': adv_loss,
         }
+
 
 
 # ============================================================================
