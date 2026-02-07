@@ -1,6 +1,7 @@
 import os
 import torch
 import lightning as L
+import copy
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -21,62 +22,208 @@ from ..train.callbacks import (
     CumulativeFLOPSCallback,
 )
 from ..utils import get_latest_checkpoint, get_embedding_cfg, get_dataset_cfg
-from src.state.emb.data.sampler import DomainBalancedSampler
 
-# [0205新增代码begin] 
-import copy
+
+# ============================================================================
+# MMD-AAE 三路并行 DataLoader
+# ============================================================================
 
 class ParallelZipLoader:
     """
-    并行混合加载器：模拟架构图中的 'Input Layer'。
-    它不合并数据，只是在迭代时同时从三个 Loader 中各取一个 Batch。
+    并行混合加载器：用于 MMD-AAE 多域训练。
+    同时从三个 DataLoader 中各取一个 Batch。
     返回格式: (batch_k562, batch_rpe1, batch_jurkat)
     """
-    def __init__(self, loaders):
+    def __init__(self, loaders, domain_names=None):
         self.loaders = loaders
+        self.domain_names = domain_names or [f"domain_{i}" for i in range(len(loaders))]
+        self._datasets = [loader.dataset for loader in loaders]
     
     def __iter__(self):
-        # 使用 zip 将三个迭代器并行
         return zip(*self.loaders)
     
     def __len__(self):
-        # 长度以最短的那个 Loader 为准 (木桶效应)
         return min(len(l) for l in self.loaders)
 
     @property
     def batch_size(self):
-        # 为了兼容部分日志打印逻辑，返回总大小
         return sum(l.batch_size for l in self.loaders)
     
     @property
     def num_workers(self):
         return self.loaders[0].num_workers
+    
+    @property
+    def datasets(self):
+        """返回所有 datasets，用于后续更新 cfg"""
+        return self._datasets
 
-# [0205新增代码end] 
 
 def get_embeddings(cfg):
-    # Load in ESM2 embeddings and special tokens
+    """Load ESM2 embeddings and special tokens"""
     all_pe = torch.load(get_embedding_cfg(cfg).all_embeddings, weights_only=False)
     if isinstance(all_pe, dict):
         all_pe = torch.vstack(list(all_pe.values()))
-
     all_pe = all_pe.cuda()
     return all_pe
 
 
+def create_domain_dataloaders(cfg, DatasetClass, collator, batch_size=32, num_workers=2):
+    """
+    创建三路并行 DataLoader
+    
+    Args:
+        cfg: 配置对象
+        DatasetClass: Dataset 类
+        collator: Collator 函数
+        batch_size: 每个域的 batch_size
+        num_workers: DataLoader workers 数量
+    
+    Returns:
+        ParallelZipLoader 实例
+    """
+    
+    # 三个细胞系的数据路径 (服务器路径)
+    BASE_DIR = "/media/mldadmin/home/s125mdg34_03/state"
+    domain_configs = [
+        {"name": "K562",   "path": f"{BASE_DIR}/competition_support_set/k562.h5"},
+        {"name": "RPE1",   "path": f"{BASE_DIR}/competition_support_set/rpe1.h5"},
+        {"name": "Jurkat", "path": f"{BASE_DIR}/competition_support_set/jurkat.h5"},
+    ]
+    
+    parallel_loaders = []
+    domain_names = []
+    
+    print(f"\n{'='*60}")
+    print(f"[MMD-AAE] 开始初始化 3 路并行 DataLoaders...")
+    print(f"{'='*60}")
+    
+    for domain in domain_configs:
+        name = domain["name"]
+        path = domain["path"]
+        
+        print(f"\n正在加载 {name}...")
+        print(f"  路径: {path}")
+        
+        # 检查文件是否存在
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"数据文件不存在: {path}")
+        
+        # 克隆配置，避免相互污染
+        dom_cfg = copy.deepcopy(cfg)
+        
+        # 修改数据路径
+        # 根据配置结构，设置正确的路径属性
+        ds_cfg = get_dataset_cfg(dom_cfg)
+        # 设置 train 路径为当前域的数据文件
+        ds_cfg.train = path
+        
+        try:
+            # 创建 Dataset
+            dom_dataset = DatasetClass(dom_cfg)
+            print(f"  ✓ Dataset 创建成功, 样本数: {len(dom_dataset)}")
+            
+            # 创建 DataLoader
+            loader = DataLoader(
+                dom_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=collator,
+                num_workers=num_workers,
+                persistent_workers=True if num_workers > 0 else False,
+                pin_memory=True,
+                drop_last=True  # 必须开启，防止尾部数据对不齐
+            )
+            parallel_loaders.append(loader)
+            domain_names.append(name)
+            print(f"  ✓ DataLoader 创建成功")
+            
+        except Exception as e:
+            print(f"  ✗ 创建失败: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    # 封装成并行加载器
+    train_dataloader = ParallelZipLoader(parallel_loaders, domain_names)
+    
+    print(f"\n{'='*60}")
+    print(f"[MMD-AAE] 并行加载器构建完成!")
+    print(f"  - 成功加载的域: {domain_names}")
+    print(f"  - 每个域 Batch Size: {batch_size}")
+    print(f"  - 总 Batch Size: {train_dataloader.batch_size}")
+    print(f"  - 每轮迭代次数: {len(train_dataloader)}")
+    print(f"{'='*60}\n")
+    
+    return train_dataloader
+
+
+def verify_parallel_dataloader(train_dataloader):
+    """验证并行 DataLoader 输出格式"""
+    print("\n" + "="*60)
+    print("正在验证 DataLoader 输出格式...")
+    print("="*60)
+    
+    try:
+        # 取一个 batch
+        test_batch = next(iter(train_dataloader))
+        
+        print(f"\nBatch 基本信息:")
+        print(f"  - Batch 类型: {type(test_batch)}")
+        print(f"  - Batch 长度: {len(test_batch)} (应该等于 3)")
+        
+        # 验证每个域的数据
+        for i, (batch, domain_name) in enumerate(zip(test_batch, train_dataloader.domain_names)):
+            print(f"\n  [{domain_name}] 数据:")
+            
+            if isinstance(batch, tuple):
+                print(f"    元素数: {len(batch)}")
+                for j, item in enumerate(batch):
+                    if item is None:
+                        print(f"    [{j}]: None")
+                    elif isinstance(item, torch.Tensor):
+                        print(f"    [{j}]: Tensor shape={item.shape}, dtype={item.dtype}")
+                    else:
+                        print(f"    [{j}]: {type(item)}")
+            elif isinstance(batch, dict):
+                print(f"    Keys: {list(batch.keys())}")
+            else:
+                print(f"    类型: {type(batch)}")
+        
+        print("\n" + "="*60)
+        print("✅ 验证通过! DataLoader 已成功并行化。")
+        print("="*60 + "\n")
+        
+        return True
+        
+    except Exception as e:
+        print(f"\n❌ 验证失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main(cfg):
-    print(f"Starting training with Embedding {cfg.embeddings.current} and dataset {cfg.dataset.current}")
+    """
+    MMD-AAE 训练主函数
+    """
+    print(f"\n{'#'*60}")
+    print(f"# MMD-AAE Training")
+    print(f"# Embedding: {cfg.embeddings.current}")
+    print(f"# Dataset: {cfg.dataset.current}")
+    print(f"{'#'*60}\n")
+    
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     os.environ["NCCL_LAUNCH_TIMEOUT"] = str(cfg.experiment.ddp_timeout)
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    
     TOTAL_N_CELL = cfg.dataset.num_cells
     EPOCH_LENGTH = int(TOTAL_N_CELL // cfg.model.batch_size // 24)
-    # ? not sure why this needs to be included but seems empirical?? no clue why this is 6
     warmup_steps = EPOCH_LENGTH * 6
 
-    train_dataset_sentence_collator = VCIDatasetSentenceCollator(cfg, is_train=True)
-    # validation should not do augmentations
-    val_dataset_sentence_collator = VCIDatasetSentenceCollator(cfg, is_train=False)
+    # 创建 Collators
+    train_collator = VCIDatasetSentenceCollator(cfg, is_train=True)
+    val_collator = VCIDatasetSentenceCollator(cfg, is_train=False)
 
     generator = torch.Generator()
     generator.manual_seed(cfg.dataset.seed)
@@ -84,83 +231,51 @@ def main(cfg):
     if get_dataset_cfg(cfg).ds_type == "h5ad":
         DatasetClass = H5adSentenceDataset
     else:
-        raise ValueError(f"Unknown dataset type: {get_dataset_cfg(cfg).ds_type}")\
-        
-# 0205 [替换原有 train_dataloader 初始化代码] ==============================
+        raise ValueError(f"Unknown dataset type: {get_dataset_cfg(cfg).ds_type}")
     
-    # 1. 定义三个细胞系的数据源路径
-    # 请务必修改为你实际的文件路径
-    domain_configs = [
-        {"name": "K562",   "path": "state/competition_support_set/k562.h5ad"},  
-        {"name": "RPE1",   "path": "state/competition_support_set/rpe1.h5ad"},
-        {"name": "Jurkat", "path": "state/competition_support_set/jurkat.h5"}
-    ]
-
-    parallel_loaders = []
-    print(f"\n[MMD-AAE Init] 开始初始化 3 路并行 DataLoaders...")
-
-    for domain in domain_configs:
-        # 1. 克隆配置，避免相互污染
-        dom_cfg = copy.deepcopy(cfg)
-        
-        # 2. 强制指向特定的 h5ad 文件
-        # 注意：这里假设 DatasetClass 读取的是 cfg.dataset.data_path
-        # 如果你的 config 结构不同，请对应修改这里的 key
-        dom_cfg.dataset.data_path = domain["path"] 
-        # 如果原代码用的是 data_dir，请改为: dom_cfg.dataset.data_dir = ...
-        
-        # 3. 实例化 Dataset
-        dom_dataset = DatasetClass(dom_cfg)
-        
-        # 4. 实例化 Loader
-        # 关键参数：
-        # batch_size=32: 确保总 batch 为 96 (32*3)
-        # drop_last=True: 必须开启，防止尾部数据对不齐导致 zip 报错
-        loader = DataLoader(
-            dom_dataset,
-            batch_size=32, 
-            shuffle=True,  
-            collate_fn=train_dataset_sentence_collator,
-            num_workers=2, 
-            persistent_workers=True,
-            pin_memory=True,
-            drop_last=True 
-        )
-        parallel_loaders.append(loader)
-        print(f"  -> {domain['name']} Loader Ready. Size: {len(dom_dataset)}")
-
-    # 5. 封装成并行加载器
-    train_dataloader = ParallelZipLoader(parallel_loaders)
-    print(f"[MMD-AAE Init] 并行加载器构建完成。总 Batch Size: {train_dataloader.batch_size}\n")
+    # ====================================================================
+    # 创建三路并行 DataLoader (MMD-AAE)
+    # ====================================================================
+    train_dataloader = create_domain_dataloaders(
+        cfg, 
+        DatasetClass, 
+        train_collator,
+        batch_size=32,   # 每个域 32，总共 96
+        num_workers=2
+    )
     
-    # [替换结束] ========================================================
-    # # 原Training dataloader
-    # train_dataset = DatasetClass(cfg)
-    # train_dataloader = DataLoader(
-    #     train_dataset,
-    #     batch_size=cfg.model.batch_size,
-    #     shuffle=True,
-    #     collate_fn=train_dataset_sentence_collator,
-    #     num_workers=cfg.dataset.num_train_workers,
-    #     persistent_workers=True,
-    #     pin_memory=True,
-    #     prefetch_factor=4,
-    #     generator=generator,
-    # )
-
-
-
+    # 验证 DataLoader
+    verify_success = verify_parallel_dataloader(train_dataloader)
+    if not verify_success:
+        print("DataLoader 验证失败，退出训练")
+        return
+    
+    # ====================================================================
+    # 以下为测试模式 - 验证成功后可注释掉 exit() 继续训练
+    # ====================================================================
+    print("\n" + "="*60)
+    print("🎉 DataLoader 测试成功!")
+    print("下一步: 注释掉下面的 return 语句以继续完整训练")
+    print("="*60 + "\n")
+    return  # <-- 验证成功后注释掉这行
+    
+    # ====================================================================
+    # 创建 Validation DataLoader (使用原始配置)
+    # ====================================================================
     val_dataset = DatasetClass(cfg, test=True)
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=cfg.model.batch_size,
         shuffle=True,
-        collate_fn=val_dataset_sentence_collator,
+        collate_fn=val_collator,
         num_workers=cfg.dataset.num_val_workers,
         persistent_workers=True,
         generator=generator,
     )
 
+    # ====================================================================
+    # 创建模型
+    # ====================================================================
     model = StateEmbeddingModel(
         token_dim=get_embedding_cfg(cfg).size,
         d_model=cfg.model.emsize,
@@ -173,24 +288,29 @@ def main(cfg):
         compiled=False,
         max_lr=cfg.optimizer.max_lr,
         emb_size=get_embedding_cfg(cfg).size,
-        collater=val_dataset_sentence_collator,
+        collater=val_collator,
         cfg=cfg,
     )
-    # Ensure model always uses the current config, even after checkpoint loading
+    
     model.update_config(cfg)
-    # Also update datasets and collaters with current config
-    train_dataset.cfg = cfg
+    
+    # 更新所有 datasets 和 collators 的 cfg
+    for ds in train_dataloader.datasets:
+        ds.cfg = cfg
     val_dataset.cfg = cfg
-    train_dataset_sentence_collator.cfg = cfg
-    val_dataset_sentence_collator.cfg = cfg
-    model.collater = val_dataset_sentence_collator
+    train_collator.cfg = cfg
+    val_collator.cfg = cfg
+    model.collater = val_collator
+    
     model = model.cuda()
     all_pe = get_embeddings(cfg)
     all_pe.requires_grad = False
     model.pe_embedding = nn.Embedding.from_pretrained(all_pe)
-
     model = model.train()
 
+    # ====================================================================
+    # 设置 Callbacks 和 Logger
+    # ====================================================================
     run_name, chk = get_latest_checkpoint(cfg)
     checkpoint_callback = ModelCheckpoint(
         every_n_train_steps=cfg.experiment.checkpoint.every_n_train_steps,
@@ -204,16 +324,13 @@ def main(cfg):
     if cfg.wandb.enable:
         try:
             import wandb
-
             exp_logger = WandbLogger(project=cfg.wandb.project, name=cfg.experiment.name)
             exp_logger.watch(model, log_freq=1000)
         except ImportError:
             print("Warning: wandb is not installed. Skipping wandb logging.")
-            print("To enable wandb logging, install it with: pip install wandb")
             exp_logger = None
         except Exception as e:
             print(f"Warning: Failed to initialize wandb logger: {e}")
-            print("Continuing without wandb logging.")
             exp_logger = None
     else:
         exp_logger = None
@@ -224,7 +341,6 @@ def main(cfg):
         ema_decay = getattr(cfg.model, "ema_decay", 0.999)
         callbacks.append(EMACallback(decay=ema_decay))
 
-    # Add cumulative FLOPS callback
     callbacks.append(CumulativeFLOPSCallback(use_backward=cfg.experiment.cumulative_flops_use_backward))
 
     max_steps = -1
@@ -232,6 +348,9 @@ def main(cfg):
         callbacks.append(ProfilerCallback(cfg=cfg))
         max_steps = cfg.experiment.profile.max_steps
 
+    # ====================================================================
+    # 创建 Trainer 并开始训练
+    # ====================================================================
     val_interval = int(cfg.experiment.val_check_interval * cfg.experiment.num_gpus_per_node * cfg.experiment.num_nodes)
     trainer = L.Trainer(
         max_epochs=cfg.experiment.num_epochs,
@@ -239,7 +358,6 @@ def main(cfg):
         callbacks=callbacks,
         devices=cfg.experiment.num_gpus_per_node,
         num_nodes=cfg.experiment.num_nodes,
-        # Accumulation
         gradient_clip_val=cfg.optimizer.max_grad_norm,
         accumulate_grad_batches=cfg.optimizer.gradient_accumulation_steps,
         precision="bf16-mixed",
@@ -249,38 +367,22 @@ def main(cfg):
             timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
         ),
         val_check_interval=val_interval,
-        # Logging
         logger=exp_logger,
         fast_dev_run=False,
         limit_val_batches=cfg.experiment.limit_val_batches,
     )
 
     if chk:
-        print(f"******** Loading chkpoint {run_name} {chk}...")
+        print(f"******** Loading checkpoint {run_name} {chk}...")
     else:
         print(f"******** Initialized fresh {run_name}...")
-# [临时验证代码：确认数据格式]
-    print("="*30)
-    print("正在验证 DataLoader 输出格式...")
-    
-    # 手动取一个 Batch 看看
-    test_batch = next(iter(train_dataloader))
-    
-    print(f"Batch 类型: {type(test_batch)}") # 应该输出 <class 'tuple'>
-    print(f"Batch 长度: {len(test_batch)}") # 应该输出 3
-    
-    # 检查第一个细胞系的数据 (K562)
-    k562_data = test_batch[0]
-    # 假设 Dataset 返回的是字典，打印 keys 确认
-    if isinstance(k562_data, dict):
-        print(f"K562 Keys: {k562_data.keys()}")
-        if 'genes' in k562_data:
-            print(f"K562 Genes Shape: {k562_data['genes'].shape}") # 预期: [32, gene_dim]
-    
-    print("验证通过！DataLoader 已成功并行化。")
-    print("="*30)
-    exit() # 验证完可以取消注释这行直接退出，不跑后面的报错
-    
-    trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=chk)
+
+    trainer.fit(
+        model=model, 
+        train_dataloaders=train_dataloader, 
+        val_dataloaders=val_dataloader, 
+        ckpt_path=chk
+    )
 
     trainer.save_checkpoint(os.path.join(cfg.experiment.checkpoint.path, f"{run_name}_final.pt"))
+    print("\n✅ Training completed!")
