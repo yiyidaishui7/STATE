@@ -1,0 +1,99 @@
+# MMD-AAE 训练配置 - 适配服务器环境
+# 基于 state-defaults.yaml 修改
+
+experiment:
+  name: mmd_aae_pretrain
+  local: local
+  compiled: false
+  deaware: false
+  cumulative_flops_use_backward: true
+  profile:
+    enable_profiler: false
+    profile_steps:
+    - 10
+    - 100
+    max_steps: 110
+  num_epochs: 16
+  num_nodes: 1
+  num_gpus_per_node: 1
+  port: 12400
+  val_check_interval: 1000
+  limit_val_batches: 100
+  ddp_timeout: 3600
+  checkpoint:
+    path: /media/mldadmin/home/s125mdg34_03/state/checkpoints
+    save_top_k: 4
+    monitor: trainer/train_loss
+    every_n_train_steps: 1000
+
+wandb:
+  enable: false  # 先关闭 wandb
+  project: mmd_aae
+
+embeddings:
+  current: competition
+  competition:
+    all_embeddings: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/ESM2_pert_features.pt
+    ds_emb_mapping: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/gene_embidx_mapping.torch
+    valid_genes_masks: null
+    size: 5120
+    num: 19790
+
+dataset:
+  name: competition
+  seed: 42
+  num_train_workers: 4
+  num_val_workers: 2
+  current: competition
+  competition:
+    ds_type: h5ad
+    train: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/k562.h5
+    val: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/hepg2.h5
+    filter: false
+  pad_length: 2048
+  pad_token_idx: 0
+  cls_token_idx: 3
+  chrom_token_right_idx: 2
+  P: 512
+  'N': 512
+  S: 512
+  num_cells: 62194  # K562 + RPE1 + Jurkat 总细胞数
+
+model:
+  name: mmd_aae
+  batch_size: 96  # 32 * 3 domains
+  emsize: 512
+  d_hid: 1024
+  nhead: 16
+  nlayers: 8
+  dropout: 0.1
+  output_dim: 512
+  use_flash_attention: true
+  rda: true
+  counts: true
+  dataset_correction: false
+  ema: false
+  ema_decay: 0.999
+  num_downsample: 1
+  variable_masking: true
+
+optimizer:
+  max_lr: 1.0e-05
+  weight_decay: 0.01
+  start: 0.33
+  end: 1.0
+  max_grad_norm: 0.8
+  gradient_accumulation_steps: 8
+  reset_lr_on_restart: false
+
+loss:
+  name: tabular
+  apply_normalization: false
+  kernel: energy
+  uniformity: false
+
+validations:
+  diff_exp:
+    enable: false
+  perturbation:
+    enable: false
