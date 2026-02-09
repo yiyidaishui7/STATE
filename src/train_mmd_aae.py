@@ -211,7 +211,7 @@ class MMD_AAE(nn.Module):
         domain_logits = self.discriminator(z)
         return x_recon, z, domain_logits
     
-    def compute_loss(self, x, domain_labels, weight_recon=1.0, weight_mmd=1.0, weight_adv=0.1, grl_alpha=1.0):
+    def compute_loss(self, x, domain_labels, weight_recon=1.0, weight_mmd=10.0, weight_adv=0.5, grl_alpha=1.0):
         x_recon, z, _ = self.forward(x)
         
         # 1. 重建损失
