@@ -192,7 +192,7 @@ print(f"\n总样本: {len(all_z)}, 隐空间维度: {all_z.shape[1]}")
 # ============================================================================
 print("\n运行 t-SNE (可能需要 1-2 分钟)...")
 
-tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
 z_2d = tsne.fit_transform(all_z)
 
 print("✅ t-SNE 完成")
