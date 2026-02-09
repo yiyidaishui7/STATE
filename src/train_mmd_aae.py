@@ -1,19 +1,24 @@
 #!/usr/bin/env python
 """
-train_mmd_aae.py - MMD-AAE 完整训练脚本
+train_mmd_aae.py - MMD-AAE 完整训练脚本 (支持实验管理)
 
 使用方法:
     cd ~/state/src
+    
+    # 默认配置
     python train_mmd_aae.py
-
-基于:
-- STATE 框架 (https://github.com/ArcInstitute/state)
-- MMD-AAE (https://github.com/YuqiCui/MMD_AAE)
+    
+    # 自定义 lambda
+    python train_mmd_aae.py --lambda_recon 1.0 --lambda_mmd 10.0 --lambda_adv 0.5
+    
+    # 自定义实验名
+    python train_mmd_aae.py --exp_name exp001 --lambda_mmd 5.0
 """
 
 import os
 import sys
 import h5py
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,6 +34,35 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 log = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 参数解析
+# ============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(description='MMD-AAE Training')
+    
+    # 实验管理
+    parser.add_argument('--exp_name', type=str, default=None,
+                        help='实验名称 (默认: 自动生成)')
+    
+    # Lambda 权重
+    parser.add_argument('--lambda_recon', type=float, default=1.0,
+                        help='重建损失权重 (默认: 1.0)')
+    parser.add_argument('--lambda_mmd', type=float, default=10.0,
+                        help='MMD损失权重 (默认: 10.0)')
+    parser.add_argument('--lambda_adv', type=float, default=0.5,
+                        help='对抗损失权重 (默认: 0.5)')
+    
+    # 训练参数
+    parser.add_argument('--epochs', type=int, default=20,
+                        help='训练轮数 (默认: 20)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='每个域的批次大小 (默认: 32)')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='学习率 (默认: 1e-4)')
+    
+    return parser.parse_args()
 
 
 # ============================================================================
@@ -95,18 +129,13 @@ class ParallelZipLoader:
 
 
 # ============================================================================
-# MMD-AAE 模型 (内联定义，避免导入问题)
+# MMD-AAE 模型
 # ============================================================================
 
 def compute_mmd_multi_kernel(x, y):
-    """
-    使用多核 MMD (多个 sigma 值的 RBF 核)
-    这种方法对不同尺度的分布差异更鲁棒
-    """
-    # 多个尺度的 sigma
+    """使用多核 MMD (多个 sigma 值的 RBF 核)"""
     sigmas = [0.01, 0.1, 1.0, 10.0, 100.0]
     
-    # 计算成对距离
     xx = torch.mm(x, x.t())
     yy = torch.mm(y, y.t())
     xy = torch.mm(x, y.t())
@@ -114,11 +143,11 @@ def compute_mmd_multi_kernel(x, y):
     rx = xx.diag().unsqueeze(0).expand_as(xx)
     ry = yy.diag().unsqueeze(0).expand_as(yy)
     
-    dxx = rx.t() + rx - 2. * xx  # (N, N)
-    dyy = ry.t() + ry - 2. * yy  # (M, M)
-    dxy = rx.t().expand(x.size(0), y.size(0)) + ry.expand(x.size(0), y.size(0)) - 2. * xy  # (N, M)
+    dxx = rx.t() + rx - 2. * xx
+    dyy = ry.t() + ry - 2. * yy
+    dxy = rx.t().expand(x.size(0), y.size(0)) + ry.expand(x.size(0), y.size(0)) - 2. * xy
     
-    mmd = x.new_zeros(1)  # 保持梯度连接！
+    mmd = x.new_zeros(1)
     
     for sigma in sigmas:
         gamma = 1.0 / (2 * sigma ** 2)
@@ -217,7 +246,7 @@ class MMD_AAE(nn.Module):
         # 1. 重建损失
         recon_loss = nn.functional.mse_loss(x_recon, x)
         
-        # 2. MMD 损失 - 使用 z 来初始化，保持梯度连接
+        # 2. MMD 损失
         mmd_losses = []
         for i in range(self.num_domains):
             for j in range(i + 1, self.num_domains):
@@ -232,7 +261,7 @@ class MMD_AAE(nn.Module):
         else:
             mmd_loss = z.new_zeros(1).squeeze()
         
-        # 3. 对抗损失 (使用梯度反转)
+        # 3. 对抗损失
         z_grl = GradientReversalFunction.apply(z, grl_alpha)
         domain_logits = self.discriminator(z_grl)
         adv_loss = nn.functional.cross_entropy(domain_logits, domain_labels)
@@ -248,12 +277,11 @@ class MMD_AAE(nn.Module):
         }
 
 
-
 # ============================================================================
 # 训练函数
 # ============================================================================
 
-def train_epoch(model, train_loader, optimizer, device, epoch, log_interval=50):
+def train_epoch(model, train_loader, optimizer, device, epoch, lambdas, log_interval=50):
     """训练一个 epoch"""
     model.train()
     
@@ -264,7 +292,6 @@ def train_epoch(model, train_loader, optimizer, device, epoch, log_interval=50):
     num_batches = 0
     
     for batch_idx, domain_batches in enumerate(train_loader):
-        # 合并三个域的数据
         all_counts = []
         all_domains = []
         for domain_id, (counts, domains) in enumerate(domain_batches):
@@ -274,20 +301,22 @@ def train_epoch(model, train_loader, optimizer, device, epoch, log_interval=50):
         x = torch.cat(all_counts, dim=0).to(device)
         domain_labels = torch.cat(all_domains, dim=0).to(device)
         
-        # 随机打乱
         perm = torch.randperm(x.size(0))
         x = x[perm]
         domain_labels = domain_labels[perm]
         
         optimizer.zero_grad()
         
-        # 计算损失
-        losses = model.compute_loss(x, domain_labels)
+        # 使用传入的 lambda 值
+        losses = model.compute_loss(
+            x, domain_labels,
+            weight_recon=lambdas['recon'],
+            weight_mmd=lambdas['mmd'],
+            weight_adv=lambdas['adv']
+        )
         losses['total'].backward()
         
-        # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
         
         total_loss += losses['total'].item()
@@ -313,37 +342,28 @@ def train_epoch(model, train_loader, optimizer, device, epoch, log_interval=50):
     }
 
 
-def validate(model, val_loader, device):
-    """验证"""
-    model.eval()
-    
-    total_loss = 0
-    num_batches = 0
-    
-    with torch.no_grad():
-        for domain_batches in val_loader:
-            all_counts = []
-            all_domains = []
-            for domain_id, (counts, domains) in enumerate(domain_batches):
-                all_counts.append(counts)
-                all_domains.append(torch.full((counts.size(0),), domain_id, dtype=torch.long))
-            
-            x = torch.cat(all_counts, dim=0).to(device)
-            domain_labels = torch.cat(all_domains, dim=0).to(device)
-            
-            losses = model.compute_loss(x, domain_labels)
-            total_loss += losses['total'].item()
-            num_batches += 1
-    
-    return total_loss / num_batches
-
-
 def main():
+    args = parse_args()
+    
     # ========================================
-    # 配置
+    # 实验配置
     # ========================================
     BASE_DIR = "/media/mldadmin/home/s125mdg34_03/state"
-    CHECKPOINT_DIR = f"{BASE_DIR}/checkpoints/mmd_aae"
+    
+    # Lambda 权重
+    LAMBDAS = {
+        'recon': args.lambda_recon,
+        'mmd': args.lambda_mmd,
+        'adv': args.lambda_adv,
+    }
+    
+    # 生成实验名称
+    if args.exp_name:
+        EXP_NAME = args.exp_name
+    else:
+        EXP_NAME = f"r{LAMBDAS['recon']}_m{LAMBDAS['mmd']}_a{LAMBDAS['adv']}"
+    
+    CHECKPOINT_DIR = f"{BASE_DIR}/checkpoints/mmd_aae/{EXP_NAME}"
     
     DOMAIN_CONFIGS = [
         {"name": "K562",   "path": f"{BASE_DIR}/competition_support_set/k562.h5"},
@@ -352,22 +372,34 @@ def main():
     ]
     
     # 超参数
-    BATCH_SIZE = 32       # 每个域
+    BATCH_SIZE = args.batch_size
     HIDDEN_DIM = 1024
     LATENT_DIM = 512
-    LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 20
+    LEARNING_RATE = args.lr
+    NUM_EPOCHS = args.epochs
     NUM_WORKERS = 2
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 创建检查点目录
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
+    # ========================================
+    # 显示配置
+    # ========================================
     log.info("=" * 60)
     log.info("MMD-AAE 训练")
     log.info("=" * 60)
+    log.info(f"实验名称: {EXP_NAME}")
+    log.info(f"检查点目录: {CHECKPOINT_DIR}")
+    log.info("-" * 60)
+    log.info(">>> Lambda 权重 <<<")
+    log.info(f"  λ_recon = {LAMBDAS['recon']}")
+    log.info(f"  λ_mmd   = {LAMBDAS['mmd']}")
+    log.info(f"  λ_adv   = {LAMBDAS['adv']}")
+    log.info("-" * 60)
     log.info(f"Device: {DEVICE}")
-    log.info(f"Batch Size: {BATCH_SIZE} x {len(DOMAIN_CONFIGS)} = {BATCH_SIZE * len(DOMAIN_CONFIGS)}")
+    log.info(f"Batch Size: {BATCH_SIZE} x 3 = {BATCH_SIZE * 3}")
+    log.info(f"Learning Rate: {LEARNING_RATE}")
+    log.info(f"Epochs: {NUM_EPOCHS}")
     
     # ========================================
     # 创建 DataLoader
@@ -434,8 +466,7 @@ def main():
     for epoch in range(1, NUM_EPOCHS + 1):
         log.info(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
         
-        # 训练
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, epoch, LAMBDAS)
         
         log.info(
             f"Epoch {epoch} 完成: "
@@ -445,31 +476,28 @@ def main():
             f"Adv={train_metrics['adv']:.4f}"
         )
         
-        # 更新学习率
         scheduler.step()
         log.info(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         
-        # 保存检查点
+        # 保存检查点 (包含 lambda 信息)
+        checkpoint_data = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_metrics['loss'],
+            'lambdas': LAMBDAS,
+            'exp_name': EXP_NAME,
+        }
+        
         if train_metrics['loss'] < best_loss:
             best_loss = train_metrics['loss']
             checkpoint_path = os.path.join(CHECKPOINT_DIR, 'best_model.pt')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_loss,
-            }, checkpoint_path)
+            torch.save(checkpoint_data, checkpoint_path)
             log.info(f"保存最佳模型: {checkpoint_path}")
         
-        # 定期保存
         if epoch % 5 == 0:
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f'model_epoch_{epoch}.pt')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': train_metrics['loss'],
-            }, checkpoint_path)
+            torch.save(checkpoint_data, checkpoint_path)
             log.info(f"保存检查点: {checkpoint_path}")
     
     # ========================================
@@ -477,6 +505,8 @@ def main():
     # ========================================
     log.info("\n" + "=" * 60)
     log.info("✅ 训练完成!")
+    log.info(f"实验名称: {EXP_NAME}")
+    log.info(f"Lambda: recon={LAMBDAS['recon']}, mmd={LAMBDAS['mmd']}, adv={LAMBDAS['adv']}")
     log.info(f"最佳 Loss: {best_loss:.4f}")
     log.info(f"检查点保存于: {CHECKPOINT_DIR}")
     log.info("=" * 60)
