@@ -1,18 +1,24 @@
 #!/usr/bin/env python
 """
-visualize_mmd_aae.py - 可视化 MMD-AAE v2 训练结果
+visualize_mmd_aae.py - 可视化 MMD-AAE 训练结果 (自动适配 v1/v2)
+
+自动检测 checkpoint 中的模型架构 (BatchNorm/LayerNorm, latent_dim 等)
 
 使用方法:
     cd ~/state/src
-    python visualize_mmd_aae.py --exp_name v2_r1.0_m10.0_a0.5
+    python visualize_mmd_aae.py --exp_name v2_m10_ep50
+    python visualize_mmd_aae.py --exp_name v2_m10_ep50 --samples 3000
 """
 
 import os
+import sys
 import argparse
 import torch
 import torch.nn as nn
 import h5py
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # 无 GUI 模式
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from torch.utils.data import Dataset, DataLoader
@@ -41,79 +47,105 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # ============================================================================
-# 模型 (与 train v2 一致: LayerNorm + latent_dim 可变)
+# 从 checkpoint keys 自动检测架构
 # ============================================================================
-class Encoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim=1024, latent_dim=64, dropout=0.2):
+def detect_architecture(state_dict):
+    """从 checkpoint 中自动推断模型架构"""
+    info = {
+        'use_layernorm': False,
+        'input_dim': None,
+        'latent_dim': None,
+        'hidden_dim': None,
+        'mid_dim': None,
+    }
+    
+    for key in state_dict.keys():
+        # 检测 LayerNorm vs BatchNorm
+        if 'LayerNorm' in key or 'layer_norm' in key:
+            info['use_layernorm'] = True
+        
+        # 从 encoder 第一层推断 input_dim 和 hidden_dim
+        if key == 'encoder.net.0.weight':
+            info['hidden_dim'] = state_dict[key].shape[0]
+            info['input_dim'] = state_dict[key].shape[1]
+        
+        # 检测中间层维度 (encoder 第二个 Linear 层)
+        if key == 'encoder.net.4.weight':
+            info['mid_dim'] = state_dict[key].shape[0]
+        
+        # 检测 latent_dim (encoder 最后一层)
+        if key == 'encoder.net.8.weight':
+            info['latent_dim'] = state_dict[key].shape[0]
+    
+    # 如果没找到 8.weight, 试 6.weight (可能只有2层)
+    if info['latent_dim'] is None:
+        for key in state_dict.keys():
+            if key == 'encoder.net.6.weight':
+                info['latent_dim'] = state_dict[key].shape[0]
+            elif key == 'encoder.net.4.weight' and info['latent_dim'] is None:
+                info['latent_dim'] = state_dict[key].shape[0]
+    
+    # 检测 BatchNorm 的存在
+    for key in state_dict.keys():
+        if 'weight' in key and 'encoder.net.1.' in key:
+            # 如果第 1 层有 weight 参数，检查是否有 running_mean (BatchNorm 标志)
+            bn_key = key.replace('weight', 'running_mean')
+            if bn_key in state_dict:
+                info['use_layernorm'] = False
+            else:
+                info['use_layernorm'] = True
+            break
+    
+    return info
+
+
+def build_encoder(info):
+    """根据检测到的架构信息构建 Encoder"""
+    input_dim = info['input_dim']
+    hidden_dim = info['hidden_dim']
+    mid_dim = info.get('mid_dim', hidden_dim // 2)
+    latent_dim = info['latent_dim']
+    NormLayer = nn.LayerNorm if info['use_layernorm'] else nn.BatchNorm1d
+    
+    encoder = nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        NormLayer(hidden_dim),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(hidden_dim, mid_dim),
+        NormLayer(mid_dim),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(mid_dim, latent_dim),
+    )
+    return encoder
+
+
+class FlexibleModel(nn.Module):
+    """灵活模型，自动适配 checkpoint"""
+    def __init__(self, state_dict):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, latent_dim),
-        )
+        info = detect_architecture(state_dict)
+        self.info = info
+        self.encoder = build_encoder(info)
+        
+        # 只需要 encoder，不需要加载 decoder/discriminator
+        encoder_state = {k.replace('encoder.', ''): v 
+                        for k, v in state_dict.items() 
+                        if k.startswith('encoder.')}
+        self.encoder.load_state_dict(encoder_state)
     
     def forward(self, x):
-        return self.net(x)
-
-
-class Decoder(nn.Module):
-    def __init__(self, latent_dim, hidden_dim=1024, output_dim=18080, dropout=0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-        )
-    
-    def forward(self, z):
-        return self.net(z)
-
-
-class DomainDiscriminator(nn.Module):
-    def __init__(self, latent_dim, hidden_dim=256, num_domains=3):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_domains),
-        )
-    
-    def forward(self, z):
-        return self.net(z)
-
-
-class MMD_AAE(nn.Module):
-    def __init__(self, input_dim, hidden_dim=1024, latent_dim=64, num_domains=3, dropout=0.2):
-        super().__init__()
-        self.encoder = Encoder(input_dim, hidden_dim, latent_dim, dropout)
-        self.decoder = Decoder(latent_dim, hidden_dim, input_dim, dropout)
-        self.discriminator = DomainDiscriminator(latent_dim, hidden_dim // 4, num_domains)
-    
-    def forward(self, x):
-        z = self.encoder(x)
-        return z
+        return self.encoder(x)
 
 
 # ============================================================================
-# Dataset (与 train v2 一致: log1p + L2 归一化)
+# Dataset
 # ============================================================================
 class SimpleH5Dataset(Dataset):
-    def __init__(self, h5_path, max_samples=None):
+    def __init__(self, h5_path, max_samples=None, use_normalize=True):
         self.h5_path = h5_path
+        self.use_normalize = use_normalize
         with h5py.File(h5_path, 'r') as f:
             self.shape = f['X'].shape
             self.num_samples = min(self.shape[0], max_samples) if max_samples else self.shape[0]
@@ -130,11 +162,11 @@ class SimpleH5Dataset(Dataset):
     def __getitem__(self, idx):
         f = self._get_file()
         counts = torch.tensor(f['X'][idx], dtype=torch.float32)
-        # ★ 与训练一致的归一化
-        counts = torch.log1p(counts)
-        norm = counts.norm(p=2)
-        if norm > 0:
-            counts = counts / norm
+        if self.use_normalize:
+            counts = torch.log1p(counts)
+            norm = counts.norm(p=2)
+            if norm > 0:
+                counts = counts / norm
         return counts
 
 
@@ -142,10 +174,10 @@ def main():
     args = parse_args()
     
     print("=" * 60)
-    print("MMD-AAE v2 可视化")
+    print("MMD-AAE 可视化 (自动架构检测)")
     print("=" * 60)
     
-    # 确定检查点
+    # ===== 1. 找到 checkpoint =====
     if args.checkpoint:
         checkpoint_path = args.checkpoint
         exp_name = os.path.basename(os.path.dirname(checkpoint_path))
@@ -160,94 +192,144 @@ def main():
                 exps.sort(key=lambda x: os.path.getmtime(os.path.join(exp_dir, x)), reverse=True)
                 exp_name = exps[0]
                 checkpoint_path = f"{exp_dir}/{exp_name}/best_model.pt"
+                print(f"自动选择最新实验: {exp_name}")
             else:
-                print("❌ 没有找到实验目录")
-                return
+                print("❌ 没有找到实验目录"); return
         else:
-            print("❌ 找不到检查点目录")
-            return
+            print("❌ 找不到检查点目录"); return
     
     print(f"\n实验: {exp_name}")
     print(f"检查点: {checkpoint_path}")
     
     if not os.path.exists(checkpoint_path):
-        print(f"❌ 文件不存在: {checkpoint_path}")
-        return
+        print(f"❌ 文件不存在: {checkpoint_path}"); return
     
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    # ===== 2. 加载 checkpoint =====
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     
-    # 读取配置
-    latent_dim = checkpoint.get('latent_dim', 64)
+    print(f"\n--- Checkpoint 信息 ---")
+    print(f"  Epoch: {checkpoint.get('epoch', '?')}")
+    print(f"  Loss: {checkpoint.get('loss', '?')}")
+    
     version = checkpoint.get('version', 'v1')
+    print(f"  Version: {version}")
     
     if 'lambdas' in checkpoint:
-        lambdas = checkpoint['lambdas']
-        print(f"\nLambda: λ_r={lambdas.get('recon')}, λ_m={lambdas.get('mmd')}, λ_a={lambdas.get('adv')}")
+        l = checkpoint['lambdas']
+        print(f"  Lambda: r={l.get('recon')}, m={l.get('mmd')}, a={l.get('adv')}")
     
-    print(f"Epoch: {checkpoint.get('epoch')}")
-    print(f"Version: {version}")
-    print(f"Latent dim: {latent_dim}")
+    if 'latent_dim' in checkpoint:
+        print(f"  Saved latent_dim: {checkpoint['latent_dim']}")
     
-    input_dim = 18080
-    model = MMD_AAE(input_dim=input_dim, latent_dim=latent_dim).to(DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    print("✅ 模型加载成功")
+    # ===== 3. 自动检测架构 =====
+    state_dict = checkpoint['model_state_dict']
     
-    # 提取隐空间
-    print("\n提取隐空间表示...")
+    print(f"\n--- 自动检测架构 ---")
+    arch_info = detect_architecture(state_dict)
+    print(f"  input_dim: {arch_info['input_dim']}")
+    print(f"  hidden_dim: {arch_info['hidden_dim']}")
+    print(f"  mid_dim: {arch_info['mid_dim']}")
+    print(f"  latent_dim: {arch_info['latent_dim']}")
+    print(f"  use_layernorm: {arch_info['use_layernorm']}")
+    
+    # 检测是否使用了输入归一化 (v2 使用，v1 不使用)
+    use_normalize = arch_info['use_layernorm']  # LayerNorm 版本使用了输入归一化
+    if version == 'v2':
+        use_normalize = True
+    print(f"  use_normalize: {use_normalize}")
+    
+    # ===== 4. 构建模型 (只需 Encoder) =====
+    try:
+        model = FlexibleModel(state_dict).to(DEVICE)
+        model.eval()
+        print("✅ 模型加载成功 (自动适配)")
+    except Exception as e:
+        print(f"❌ 模型加载失败: {e}")
+        print("\n[DEBUG] checkpoint keys:")
+        for k, v in state_dict.items():
+            if 'encoder' in k:
+                print(f"  {k}: {v.shape}")
+        return
+    
+    # ===== 5. 提取隐空间 =====
+    print(f"\n--- 提取隐空间 (每域 {args.samples} 个样本) ---")
     
     all_z = []
     all_domains = []
+    total_points = 0
     
     for domain_id, domain in enumerate(DOMAIN_CONFIGS):
-        print(f"  处理 {domain['name']}...")
-        dataset = SimpleH5Dataset(domain['path'], max_samples=args.samples)
-        loader = DataLoader(dataset, batch_size=256, shuffle=True)
+        if not os.path.exists(domain['path']):
+            print(f"  ⚠️ 跳过 {domain['name']}: 文件不存在 {domain['path']}")
+            continue
+        
+        dataset = SimpleH5Dataset(domain['path'], max_samples=args.samples, 
+                                  use_normalize=use_normalize)
+        loader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=0)
         
         z_list = []
+        sample_count = 0
+        
         with torch.no_grad():
             for batch in loader:
                 x = batch.to(DEVICE)
                 z = model(x)
                 z_list.append(z.cpu())
-                if len(torch.cat(z_list)) >= args.samples:
+                sample_count += x.size(0)
+                if sample_count >= args.samples:
                     break
+        
+        if len(z_list) == 0:
+            print(f"  ⚠️ {domain['name']}: 0 个样本!")
+            continue
         
         z_domain = torch.cat(z_list)[:args.samples]
         all_z.append(z_domain)
         all_domains.extend([domain_id] * len(z_domain))
-        print(f"    采样 {len(z_domain)} 个细胞")
+        total_points += len(z_domain)
+        print(f"  ✅ {domain['name']}: {len(z_domain)} 个样本, z.shape={z_domain.shape}")
+    
+    if total_points == 0:
+        print("❌ 没有采集到任何样本!"); return
     
     all_z = torch.cat(all_z).numpy()
     all_domains = np.array(all_domains)
     
-    # t-SNE
-    print(f"\n运行 t-SNE (隐空间维度: {all_z.shape[1]})...")
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
+    print(f"\n总计: {total_points} 个点, latent_dim={all_z.shape[1]}")
+    
+    # ===== 6. t-SNE =====
+    print(f"\n运行 t-SNE...")
+    perplexity = min(30, total_points // 4)  # 自适应 perplexity
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
     z_2d = tsne.fit_transform(all_z)
     print("✅ t-SNE 完成")
     
-    # 绘图
+    # ===== 7. 绘图 =====
     fig, axes = plt.subplots(1, 2, figsize=(18, 8))
     
     if 'lambdas' in checkpoint:
         l = checkpoint['lambdas']
-        title = f"Exp: {exp_name} | λ_r={l.get('recon')}, λ_m={l.get('mmd')}, λ_a={l.get('adv')} | latent={latent_dim}"
+        title = (f"Exp: {exp_name} | λ_r={l.get('recon')}, λ_m={l.get('mmd')}, "
+                 f"λ_a={l.get('adv')} | latent={arch_info['latent_dim']} | "
+                 f"{'LayerNorm' if arch_info['use_layernorm'] else 'BatchNorm'} | "
+                 f"N={total_points}")
     else:
-        title = f"Exp: {exp_name}"
-    fig.suptitle(title, fontsize=13, fontweight='bold')
+        title = f"Exp: {exp_name} | N={total_points}"
+    fig.suptitle(title, fontsize=12, fontweight='bold')
     
     # 散点图
     ax1 = axes[0]
     for domain_id, domain in enumerate(DOMAIN_CONFIGS):
         mask = all_domains == domain_id
-        ax1.scatter(z_2d[mask, 0], z_2d[mask, 1], c=domain['color'],
-                    label=domain['name'], alpha=0.5, s=25, edgecolors='none')
+        n_points = mask.sum()
+        if n_points > 0:
+            ax1.scatter(z_2d[mask, 0], z_2d[mask, 1], c=domain['color'],
+                        label=f"{domain['name']} (n={n_points})",
+                        alpha=0.5, s=20, edgecolors='none')
     ax1.set_title('t-SNE of Latent Space (by Domain)')
     ax1.set_xlabel('t-SNE 1')
     ax1.set_ylabel('t-SNE 2')
-    ax1.legend(title='Domain')
+    ax1.legend(title='Domain', fontsize=10)
     ax1.grid(True, alpha=0.3)
     
     # 密度图
@@ -256,6 +338,8 @@ def main():
         from scipy.stats import gaussian_kde
         for domain_id, domain in enumerate(DOMAIN_CONFIGS):
             mask = all_domains == domain_id
+            if mask.sum() < 10:
+                continue
             x = z_2d[mask, 0]
             y = z_2d[mask, 1]
             xy = np.vstack([x, y])
@@ -266,17 +350,19 @@ def main():
             positions = np.vstack([xx.ravel(), yy.ravel()])
             f = np.reshape(kde(positions).T, xx.shape)
             ax2.contour(xx, yy, f, levels=3, colors=domain['color'], alpha=0.8)
-    except:
-        pass
+    except Exception as e:
+        print(f"  KDE 绘制跳过: {e}")
     
     for domain_id, domain in enumerate(DOMAIN_CONFIGS):
         mask = all_domains == domain_id
-        ax2.scatter(z_2d[mask, 0], z_2d[mask, 1], c=domain['color'],
-                    label=domain['name'], alpha=0.4, s=15, edgecolors='none')
-    ax2.set_title('Domain Overlap Visualization')
+        if mask.sum() > 0:
+            ax2.scatter(z_2d[mask, 0], z_2d[mask, 1], c=domain['color'],
+                        label=f"{domain['name']} (n={mask.sum()})",
+                        alpha=0.4, s=12, edgecolors='none')
+    ax2.set_title('Domain Overlap + Density')
     ax2.set_xlabel('t-SNE 1')
     ax2.set_ylabel('t-SNE 2')
-    ax2.legend(title='Domain')
+    ax2.legend(title='Domain', fontsize=10)
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
