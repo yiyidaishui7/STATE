@@ -22,7 +22,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='MMD-AAE Visualization')
     parser.add_argument('--exp_name', type=str, default=None)
     parser.add_argument('--checkpoint', type=str, default=None)
-    parser.add_argument('--samples', type=int, default=500)
+    parser.add_argument('--samples', type=int, default=2000,
+                        help='每个域的采样数量 (默认: 2000)')
     return parser.parse_args()
 
 
@@ -202,7 +203,7 @@ def main():
     for domain_id, domain in enumerate(DOMAIN_CONFIGS):
         print(f"  处理 {domain['name']}...")
         dataset = SimpleH5Dataset(domain['path'], max_samples=args.samples)
-        loader = DataLoader(dataset, batch_size=64, shuffle=True)
+        loader = DataLoader(dataset, batch_size=256, shuffle=True)
         
         z_list = []
         with torch.no_grad():
@@ -228,7 +229,7 @@ def main():
     print("✅ t-SNE 完成")
     
     # 绘图
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
     
     if 'lambdas' in checkpoint:
         l = checkpoint['lambdas']
@@ -242,7 +243,7 @@ def main():
     for domain_id, domain in enumerate(DOMAIN_CONFIGS):
         mask = all_domains == domain_id
         ax1.scatter(z_2d[mask, 0], z_2d[mask, 1], c=domain['color'],
-                    label=domain['name'], alpha=0.6, s=10)
+                    label=domain['name'], alpha=0.5, s=25, edgecolors='none')
     ax1.set_title('t-SNE of Latent Space (by Domain)')
     ax1.set_xlabel('t-SNE 1')
     ax1.set_ylabel('t-SNE 2')
@@ -271,7 +272,7 @@ def main():
     for domain_id, domain in enumerate(DOMAIN_CONFIGS):
         mask = all_domains == domain_id
         ax2.scatter(z_2d[mask, 0], z_2d[mask, 1], c=domain['color'],
-                    label=domain['name'], alpha=0.3, s=5)
+                    label=domain['name'], alpha=0.4, s=15, edgecolors='none')
     ax2.set_title('Domain Overlap Visualization')
     ax2.set_xlabel('t-SNE 1')
     ax2.set_ylabel('t-SNE 2')
@@ -281,7 +282,7 @@ def main():
     plt.tight_layout()
     
     output_path = os.path.join(OUTPUT_DIR, f'tsne_{exp_name}.png')
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=200, bbox_inches='tight')
     print(f"\n✅ 图片已保存: {output_path}")
     print("=" * 60)
     plt.close()
