@@ -653,6 +653,8 @@ def main():
     log.info(f"  λ_adv: 0 → {LAMBDAS['adv']}")
     log.info("=" * 60)
     
+    best_loss = float('inf')  # 重置! Phase 3 的 best 才有意义
+    
     for epoch in range(1, align_epochs + 1):
         global_epoch = recon_warmup + epoch
         

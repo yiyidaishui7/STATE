@@ -66,7 +66,8 @@ def parse_args():
     parser.add_argument('--compare', type=str, nargs='+', help='对比多个实验')
     parser.add_argument('--all', action='store_true', help='评估所有实验')
     parser.add_argument('--samples', type=int, default=2000, help='每域采样数')
-    parser.add_argument('--checkpoint_file', type=str, default='best_model.pt')
+    parser.add_argument('--checkpoint_file', type=str, default='final_model.pt',
+                        help='默认使用 final_model.pt (完整训练后的模型)')
     return parser.parse_args()
 
 
@@ -248,12 +249,17 @@ def metric_mmd(z_all, domains_all, n_domains=3):
         yy = np.dot(y, y.T)
         xy = np.dot(x, y.T)
         
-        rx = np.diag(xx)[:, None] * np.ones((1, len(x)))
-        ry = np.diag(yy)[:, None] * np.ones((1, len(y)))
+        rx = np.diag(xx)
+        ry = np.diag(yy)
         
-        dxx = rx.T + rx - 2 * xx
-        dyy = ry.T + ry - 2 * yy
-        dxy = rx.T + np.ones((len(x), 1)) @ ry.T[0:1, :] - 2 * xy
+        dxx = rx[:, None] + rx[None, :] - 2 * xx
+        dyy = ry[:, None] + ry[None, :] - 2 * yy
+        dxy = rx[:, None] + ry[None, :] - 2 * xy
+        
+        # 防止数值误差导致负距离 → exp 爆炸 → -inf
+        dxx = np.maximum(dxx, 0)
+        dyy = np.maximum(dyy, 0)
+        dxy = np.maximum(dxy, 0)
         
         mmd = 0.0
         for sigma in sigmas:
@@ -339,8 +345,14 @@ def evaluate_experiment(exp_name, args):
     
     checkpoint_path = os.path.join(CHECKPOINT_DIR, exp_name, args.checkpoint_file)
     
+    # 兼容旧实验: 如果 final_model.pt 不存在, 退回到 best_model.pt
+    if not os.path.exists(checkpoint_path) and args.checkpoint_file == 'final_model.pt':
+        fallback = os.path.join(CHECKPOINT_DIR, exp_name, 'best_model.pt')
+        if os.path.exists(fallback):
+            checkpoint_path = fallback
+    
     if not os.path.exists(checkpoint_path):
-        print(f"  ❌ 跳过 {exp_name}: {checkpoint_path} 不存在")
+        print(f"  ❌ 跳过 {exp_name}: 未找到 checkpoint")
         return None
     
     print(f"\n{'='*60}")
