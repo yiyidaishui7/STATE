@@ -444,7 +444,7 @@ def main():
     if args.exp_name:
         EXP_NAME = args.exp_name
     else:
-        EXP_NAME = f"v2_r{LAMBDAS['recon']}_m{LAMBDAS['mmd']}_a{LAMBDAS['adv']}"
+        EXP_NAME = f"v3_r{LAMBDAS['recon']}_m{LAMBDAS['mmd']}_a{LAMBDAS['adv']}"
     
     CHECKPOINT_DIR = f"{BASE_DIR}/checkpoints/mmd_aae/{EXP_NAME}"
     
@@ -466,14 +466,14 @@ def main():
     
     # 显示配置
     log.info("=" * 60)
-    log.info("MMD-AAE 训练 v2 (架构修复版)")
+    log.info("MMD-AAE 训练 v3 (3阶段训练)")
     log.info("=" * 60)
     log.info(f"实验名称: {EXP_NAME}")
     log.info(f"检查点目录: {CHECKPOINT_DIR}")
     log.info("-" * 60)
     log.info(">>> 修复内容 <<<")
     log.info("  [1] BatchNorm → LayerNorm")
-    log.info("  [2] 输入 log1p + L2 归一化")
+    log.info("  [2] 输入 log1p + z-score 归一化")
     log.info(f"  [3] latent_dim = {LATENT_DIM} (原 512)")
     log.info("  [4] MMD sigma = median heuristic")
     log.info("-" * 60)
@@ -541,7 +541,7 @@ def main():
     # 优化器
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10,
-                                                      min_lr=1e-5, verbose=True)
+                                                      min_lr=1e-5)
     
     # ============================================================
     # Phase 1: 纯重建预热 (训练好 autoencoder)
