@@ -47,8 +47,14 @@ def parse_args():
     
     # Lambda
     parser.add_argument('--lambda_recon', type=float, default=1.0)
-    parser.add_argument('--lambda_mmd', type=float, default=2500.0)
+    parser.add_argument('--lambda_mmd', type=float, default=0.0,
+                        help='MMD 权重. 设 0 则自动校准')
     parser.add_argument('--lambda_adv', type=float, default=0.1)
+    parser.add_argument('--auto_lambda', action='store_true', default=True,
+                        help='自动校准 lambda (默认开启). 用 --no_auto_lambda 关闭')
+    parser.add_argument('--no_auto_lambda', dest='auto_lambda', action='store_false')
+    parser.add_argument('--mmd_target_ratio', type=float, default=1.0,
+                        help='MMD 相对于 Recon 的目标比例 (默认 1.0 = 等权)')
     
     # 训练
     parser.add_argument('--epochs', type=int, default=50)
@@ -534,6 +540,68 @@ def main():
     log.info("\n开始训练...")
     log.info(f"学习率 warmup: {warmup_epochs} epochs")
     log.info("-" * 60)
+    
+    # ===== 自动 Lambda 校准 =====
+    if args.auto_lambda and LAMBDAS['mmd'] == 0.0:
+        log.info("\n" + "=" * 60)
+        log.info("★ 自动 Lambda 校准 (跑 1 轮测量各 loss 量级)")
+        log.info("=" * 60)
+        
+        model.train()
+        recon_sum, mmd_sum, adv_sum = 0.0, 0.0, 0.0
+        n_cal = 0
+        
+        for batch_idx, domain_batches in enumerate(train_loader):
+            all_counts = []
+            all_domains = []
+            for domain_id, (counts, domains) in enumerate(domain_batches):
+                all_counts.append(counts)
+                all_domains.append(torch.full((counts.size(0),), domain_id, dtype=torch.long))
+            
+            x = torch.cat(all_counts, dim=0).to(DEVICE)
+            domain_labels = torch.cat(all_domains, dim=0).to(DEVICE)
+            
+            with torch.no_grad():
+                losses = model.compute_loss(x, domain_labels,
+                                          weight_recon=1.0, weight_mmd=1.0, weight_adv=1.0)
+            
+            recon_sum += losses['recon'].item()
+            mmd_sum += losses['mmd'].item()
+            adv_sum += losses['adv'].item()
+            n_cal += 1
+            
+            if n_cal >= 50:  # 只需 50 个 batch 就够了
+                break
+        
+        avg_recon = recon_sum / n_cal
+        avg_mmd = mmd_sum / n_cal
+        avg_adv = adv_sum / n_cal
+        
+        log.info(f"\n  原始量级 (λ=1.0):")
+        log.info(f"    Recon = {avg_recon:.10f}")
+        log.info(f"    MMD   = {avg_mmd:.10f}")
+        log.info(f"    Adv   = {avg_adv:.10f}")
+        
+        # 计算使 MMD 与 Recon 等量级的 lambda
+        if avg_mmd > 1e-15:
+            auto_lambda_mmd = (avg_recon / avg_mmd) * args.mmd_target_ratio
+        else:
+            auto_lambda_mmd = 1000.0
+            log.info("  ⚠️ MMD 太小，使用默认 lambda_mmd=1000")
+        
+        LAMBDAS['mmd'] = auto_lambda_mmd
+        
+        log.info(f"\n  ★ 自动校准 λ_mmd = {LAMBDAS['mmd']:.2f}")
+        log.info(f"    (使 λ_mmd × MMD ≈ {args.mmd_target_ratio} × Recon)")
+        log.info(f"    校准后等效: Recon={avg_recon:.8f}, "
+                 f"MMD_weighted={LAMBDAS['mmd'] * avg_mmd:.8f}, "
+                 f"Adv_weighted={LAMBDAS['adv'] * avg_adv:.8f}")
+        log.info("=" * 60)
+    elif LAMBDAS['mmd'] == 0.0:
+        LAMBDAS['mmd'] = 10.0  # 如果没开 auto 但也没设值，用安全默认
+        log.info(f"\nλ_mmd 未设置，使用默认值: {LAMBDAS['mmd']}")
+    
+    log.info(f"\n最终 Lambda: recon={LAMBDAS['recon']}, mmd={LAMBDAS['mmd']:.2f}, adv={LAMBDAS['adv']}")
     
     best_loss = float('inf')
     
