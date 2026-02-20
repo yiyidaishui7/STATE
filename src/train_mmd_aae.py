@@ -318,10 +318,12 @@ class MMD_AAE(nn.Module):
         domain_logits = self.discriminator(z_grl)
         adv_loss = nn.functional.cross_entropy(domain_logits, domain_labels)
         
-        # 4. ★ z 方差正则化 (防止 encoder 坍缩)
-        #    惩罚 z 各维度方差太低，迫使 encoder 产生多样化的 z
-        z_var = z.var(dim=0).mean()  # 各维度方差的均值
-        var_loss = 1.0 / (z_var + 1e-6)  # 方差越小惩罚越大
+        # 4. ★ z 正则化: 匹配 z → N(0, 1)
+        #    类似 VAE 的 KL 约束，防止坍缩 (var→0) 和爆炸 (var→∞)
+        z_mean = z.mean(dim=0)
+        z_var = z.var(dim=0)
+        # KL(q||p) where q=N(z_mean, z_var), p=N(0,1)
+        var_loss = 0.5 * (z_var + z_mean**2 - 1 - torch.log(z_var + 1e-8)).mean()
         
         # 总损失
         total_loss = (weight_recon * recon_loss + weight_mmd * mmd_loss + 
@@ -333,7 +335,7 @@ class MMD_AAE(nn.Module):
             'mmd': mmd_loss,
             'adv': adv_loss,
             'var': var_loss,
-            'z_var': z_var,
+            'z_var': z_var.mean(),
         }
 
 
