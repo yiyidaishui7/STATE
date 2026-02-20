@@ -47,8 +47,8 @@ def parse_args():
     
     # Lambda
     parser.add_argument('--lambda_recon', type=float, default=1.0)
-    parser.add_argument('--lambda_mmd', type=float, default=10.0)
-    parser.add_argument('--lambda_adv', type=float, default=0.5)
+    parser.add_argument('--lambda_mmd', type=float, default=2500.0)
+    parser.add_argument('--lambda_adv', type=float, default=0.1)
     
     # 训练
     parser.add_argument('--epochs', type=int, default=50)
@@ -366,10 +366,10 @@ def train_epoch(model, train_loader, optimizer, device, epoch, lambdas, log_inte
         if batch_idx % log_interval == 0:
             log.info(
                 f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] "
-                f"Loss: {losses['total'].item():.4f} "
-                f"(Recon: {losses['recon'].item():.4f}, "
-                f"MMD: {losses['mmd'].item():.4f}, "
-                f"Adv: {losses['adv'].item():.4f})"
+                f"Loss: {losses['total'].item():.8f} "
+                f"(Recon: {losses['recon'].item():.8f}, "
+                f"MMD: {losses['mmd'].item():.8f}, "
+                f"Adv: {losses['adv'].item():.8f})"
             )
     
     # ★ v3: 每个 epoch 输出诊断信息
@@ -544,10 +544,10 @@ def main():
         
         log.info(
             f"Epoch {epoch} 完成: "
-            f"Loss={train_metrics['loss']:.4f}, "
-            f"Recon={train_metrics['recon']:.4f}, "
-            f"MMD={train_metrics['mmd']:.4f}, "
-            f"Adv={train_metrics['adv']:.4f}"
+            f"Loss={train_metrics['loss']:.8f}, "
+            f"Recon={train_metrics['recon']:.8f}, "
+            f"MMD={train_metrics['mmd']:.8f}, "
+            f"Adv={train_metrics['adv']:.8f}"
         )
         
         scheduler.step()
