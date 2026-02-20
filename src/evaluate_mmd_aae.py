@@ -358,6 +358,9 @@ def evaluate_experiment(exp_name, args):
     # v3 保存了 global_mean/std
     global_mean = checkpoint.get('global_mean', None)
     global_std = checkpoint.get('global_std', None)
+    if global_mean is not None:
+        global_mean = global_mean.cpu()
+        global_std = global_std.cpu()
     
     print(f"  Version: {version}")
     print(f"  Epoch: {checkpoint.get('epoch', '?')}")
