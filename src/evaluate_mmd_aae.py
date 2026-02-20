@@ -77,24 +77,36 @@ def detect_architecture(state_dict):
     info = {'use_layernorm': False, 'input_dim': None, 'latent_dim': None,
             'hidden_dim': None, 'mid_dim': None}
     
+    # 统一 key: 去掉 net. 前缀
+    # encoder.net.0.weight → encoder.0.weight
+    # encoder.0.weight → encoder.0.weight (不变)
+    normalized = {}
     for key in state_dict.keys():
-        if key == 'encoder.net.0.weight':
-            info['hidden_dim'] = state_dict[key].shape[0]
-            info['input_dim'] = state_dict[key].shape[1]
-        if key == 'encoder.net.4.weight':
-            info['mid_dim'] = state_dict[key].shape[0]
-        if key == 'encoder.net.8.weight':
-            info['latent_dim'] = state_dict[key].shape[0]
+        nk = key.replace('encoder.net.', 'encoder.').replace('decoder.net.', 'decoder.')
+        normalized[nk] = key  # 映射到原始 key
+    
+    for nk, orig in normalized.items():
+        if nk == 'encoder.0.weight':
+            info['hidden_dim'] = state_dict[orig].shape[0]
+            info['input_dim'] = state_dict[orig].shape[1]
+        if nk == 'encoder.4.weight':
+            info['mid_dim'] = state_dict[orig].shape[0]
+        if nk == 'encoder.8.weight':
+            info['latent_dim'] = state_dict[orig].shape[0]
     
     if info['latent_dim'] is None:
-        for key in state_dict.keys():
-            if key == 'encoder.net.6.weight':
-                info['latent_dim'] = state_dict[key].shape[0]
+        for nk, orig in normalized.items():
+            if nk == 'encoder.6.weight':
+                info['latent_dim'] = state_dict[orig].shape[0]
     
-    for key in state_dict.keys():
-        if 'encoder.net.1.' in key and 'weight' in key:
-            bn_key = key.replace('weight', 'running_mean')
-            info['use_layernorm'] = bn_key not in state_dict
+    # 检测 BatchNorm vs LayerNorm
+    for nk, orig in normalized.items():
+        if 'encoder.1.' in nk and 'weight' in nk:
+            bn_key_normalized = nk.replace('weight', 'running_mean')
+            # 检查原始 key 空间中是否有 running_mean
+            has_running_mean = any('running_mean' in k and ('encoder.net.1.' in k or 'encoder.1.' in k) 
+                                  for k in state_dict.keys())
+            info['use_layernorm'] = not has_running_mean
             break
     
     return info
@@ -126,8 +138,18 @@ def build_model_from_checkpoint(state_dict, info):
     
     model = nn.ModuleDict({'encoder': encoder, 'decoder': decoder})
     
-    enc_state = {k.replace('encoder.', ''): v for k, v in state_dict.items() if k.startswith('encoder.')}
-    dec_state = {k.replace('decoder.', ''): v for k, v in state_dict.items() if k.startswith('decoder.')}
+    # 处理 key 前缀: encoder.net.0.weight → 0.weight
+    enc_state = {}
+    for k, v in state_dict.items():
+        if k.startswith('encoder.'):
+            new_key = k.replace('encoder.net.', '').replace('encoder.', '')
+            enc_state[new_key] = v
+    
+    dec_state = {}
+    for k, v in state_dict.items():
+        if k.startswith('decoder.'):
+            new_key = k.replace('decoder.net.', '').replace('decoder.', '')
+            dec_state[new_key] = v
     
     model['encoder'].load_state_dict(enc_state)
     model['decoder'].load_state_dict(dec_state)
