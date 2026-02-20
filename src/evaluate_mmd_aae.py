@@ -158,9 +158,12 @@ def build_model_from_checkpoint(state_dict, info):
 
 
 class SimpleH5Dataset(Dataset):
-    def __init__(self, h5_path, max_samples=None, use_normalize=True):
+    def __init__(self, h5_path, max_samples=None, use_normalize=True,
+                 global_mean=None, global_std=None):
         self.h5_path = h5_path
         self.use_normalize = use_normalize
+        self.global_mean = global_mean
+        self.global_std = global_std
         with h5py.File(h5_path, 'r') as f:
             total = f['X'].shape[0]
             self.num_samples = min(total, max_samples) if max_samples else total
@@ -179,9 +182,14 @@ class SimpleH5Dataset(Dataset):
         counts = torch.tensor(f['X'][idx], dtype=torch.float32)
         if self.use_normalize:
             counts = torch.log1p(counts)
-            norm = counts.norm(p=2)
-            if norm > 0:
-                counts = counts / norm
+            if self.global_mean is not None:
+                # v3: z-score 标准化
+                counts = (counts - self.global_mean) / self.global_std
+            else:
+                # v2: L2 归一化
+                norm = counts.norm(p=2)
+                if norm > 0:
+                    counts = counts / norm
         return counts
 
 
@@ -345,12 +353,18 @@ def evaluate_experiment(exp_name, args):
     info = detect_architecture(state_dict)
     
     version = checkpoint.get('version', 'v1')
-    use_normalize = info['use_layernorm'] or version == 'v2'
+    use_normalize = info['use_layernorm'] or version in ('v2', 'v3')
+    
+    # v3 保存了 global_mean/std
+    global_mean = checkpoint.get('global_mean', None)
+    global_std = checkpoint.get('global_std', None)
     
     print(f"  Version: {version}")
     print(f"  Epoch: {checkpoint.get('epoch', '?')}")
     print(f"  Latent dim: {info['latent_dim']}")
     print(f"  Norm: {'LayerNorm' if info['use_layernorm'] else 'BatchNorm'}")
+    if global_mean is not None:
+        print(f"  Input norm: z-score (global mean/std)")
     
     if 'lambdas' in checkpoint:
         l = checkpoint['lambdas']
@@ -376,7 +390,9 @@ def evaluate_experiment(exp_name, args):
             print(f"  ⚠️ 跳过 {domain['name']}: 文件不存在")
             continue
         
-        ds = SimpleH5Dataset(domain['path'], max_samples=args.samples, use_normalize=use_normalize)
+        ds = SimpleH5Dataset(domain['path'], max_samples=args.samples,
+                             use_normalize=use_normalize,
+                             global_mean=global_mean, global_std=global_std)
         datasets.append(ds)
         loader = DataLoader(ds, batch_size=256, shuffle=True, num_workers=0)
         
