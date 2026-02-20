@@ -54,14 +54,18 @@ def parse_args():
                         help='自动校准 lambda (默认开启). 用 --no_auto_lambda 关闭')
     parser.add_argument('--no_auto_lambda', dest='auto_lambda', action='store_false')
     parser.add_argument('--mmd_target_ratio', type=float, default=1.0,
-                        help='MMD 相对于 Recon 的目标比例 (默认 1.0 = 等权)')
+                        help='MMD 相对于 Recon 的目标比例')
     
-    # 训练
-    parser.add_argument('--epochs', type=int, default=50)
+    # 训练阶段
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--warmup_epochs', type=int, default=5,
-                        help='学习率 warmup 的 epoch 数')
+    parser.add_argument('--recon_warmup', type=int, default=20,
+                        help='纯重建预热 epoch 数 (先训练好 autoencoder)')
+    parser.add_argument('--rampup_epochs', type=int, default=20,
+                        help='MMD/ADV 权重线性上升的 epoch 数')
+    parser.add_argument('--lambda_var', type=float, default=1.0,
+                        help='z 方差正则化权重 (防止 encoder 坍缩)')
     
     # 模型
     parser.add_argument('--latent_dim', type=int, default=64)
@@ -287,7 +291,8 @@ class MMD_AAE(nn.Module):
         domain_logits = self.discriminator(z)
         return x_recon, z, domain_logits
     
-    def compute_loss(self, x, domain_labels, weight_recon=1.0, weight_mmd=10.0, weight_adv=0.5, grl_alpha=1.0):
+    def compute_loss(self, x, domain_labels, weight_recon=1.0, weight_mmd=10.0, weight_adv=0.5,
+                     weight_var=1.0, grl_alpha=1.0):
         x_recon, z, _ = self.forward(x)
         
         # 1. 重建损失
@@ -313,14 +318,22 @@ class MMD_AAE(nn.Module):
         domain_logits = self.discriminator(z_grl)
         adv_loss = nn.functional.cross_entropy(domain_logits, domain_labels)
         
+        # 4. ★ z 方差正则化 (防止 encoder 坍缩)
+        #    惩罚 z 各维度方差太低，迫使 encoder 产生多样化的 z
+        z_var = z.var(dim=0).mean()  # 各维度方差的均值
+        var_loss = 1.0 / (z_var + 1e-6)  # 方差越小惩罚越大
+        
         # 总损失
-        total_loss = weight_recon * recon_loss + weight_mmd * mmd_loss + weight_adv * adv_loss
+        total_loss = (weight_recon * recon_loss + weight_mmd * mmd_loss + 
+                      weight_adv * adv_loss + weight_var * var_loss)
         
         return {
             'total': total_loss,
             'recon': recon_loss,
             'mmd': mmd_loss,
             'adv': adv_loss,
+            'var': var_loss,
+            'z_var': z_var,
         }
 
 
@@ -334,6 +347,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, lambdas, log_inte
     total_recon = 0
     total_mmd = 0
     total_adv = 0
+    total_var = 0
     num_batches = 0
     
     for batch_idx, domain_batches in enumerate(train_loader):
@@ -356,42 +370,46 @@ def train_epoch(model, train_loader, optimizer, device, epoch, lambdas, log_inte
             x, domain_labels,
             weight_recon=lambdas['recon'],
             weight_mmd=lambdas['mmd'],
-            weight_adv=lambdas['adv']
+            weight_adv=lambdas['adv'],
+            weight_var=lambdas.get('var', 0.0),
         )
         losses['total'].backward()
         
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
         
         total_loss += losses['total'].item()
         total_recon += losses['recon'].item()
         total_mmd += losses['mmd'].item()
         total_adv += losses['adv'].item()
+        total_var += losses.get('z_var', torch.tensor(0.0)).item()
         num_batches += 1
         
         if batch_idx % log_interval == 0:
+            phase_str = ""
+            if lambdas['mmd'] == 0 and lambdas['adv'] == 0:
+                phase_str = "[WARMUP] "
             log.info(
-                f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] "
+                f"{phase_str}Epoch {epoch} [{batch_idx}/{len(train_loader)}] "
                 f"Loss: {losses['total'].item():.8f} "
                 f"(Recon: {losses['recon'].item():.8f}, "
                 f"MMD: {losses['mmd'].item():.8f}, "
-                f"Adv: {losses['adv'].item():.8f})"
+                f"Adv: {losses['adv'].item():.8f}, "
+                f"z_var: {losses.get('z_var', torch.tensor(0.0)).item():.6f})"
             )
     
-    # ★ v3: 每个 epoch 输出诊断信息
+    # ★ 每个 epoch 输出诊断信息
     model.eval()
     with torch.no_grad():
-        # 取最后一个 batch 做诊断
         z = model.encoder(x)
         z_np = z.cpu().numpy()
+        per_dim_std = z_np.std(axis=0)
         log.info(f"  [诊断] z 统计: mean={z_np.mean():.4f}, std={z_np.std():.4f}, "
                  f"min={z_np.min():.4f}, max={z_np.max():.4f}")
-        log.info(f"  [诊断] z 各维度 std: mean={z_np.std(axis=0).mean():.4f}, "
-                 f"min={z_np.std(axis=0).min():.4f}")
-        # 检查 x 输入统计
+        log.info(f"  [诊断] z 各维度 std: mean={per_dim_std.mean():.6f}, "
+                 f"min={per_dim_std.min():.6f}, max={per_dim_std.max():.6f}")
         x_np = x.cpu().numpy()
-        log.info(f"  [诊断] x 输入: mean={x_np.mean():.4f}, std={x_np.std():.4f}, "
-                 f"max={x_np.max():.4f}")
+        log.info(f"  [诊断] x 输入: mean={x_np.mean():.4f}, std={x_np.std():.4f}")
     
     # 梯度范数
     total_grad = 0
@@ -408,6 +426,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, lambdas, log_inte
         'recon': total_recon / num_batches,
         'mmd': total_mmd / num_batches,
         'adv': total_adv / num_batches,
+        'z_var': total_var / num_batches,
     }
 
 
@@ -519,32 +538,56 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"模型参数量: {num_params:,}")
     
-    # 优化器 (★ v3: 带 warmup 的学习率调度)
+    # 优化器
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10,
+                                                      min_lr=1e-5, verbose=True)
     
-    warmup_epochs = args.warmup_epochs
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs  # 线性 warmup
-        else:
-            # cosine decay
-            progress = (epoch - warmup_epochs) / max(NUM_EPOCHS - warmup_epochs, 1)
-            return 0.5 * (1 + np.cos(np.pi * progress))
+    # ============================================================
+    # Phase 1: 纯重建预热 (训练好 autoencoder)
+    # ============================================================
+    recon_warmup = args.recon_warmup
+    rampup_epochs = args.rampup_epochs
+    target_lambda_mmd = LAMBDAS['mmd']  # 可能是0 (待自动校准) 或用户指定值
     
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    log.info("\n" + "=" * 60)
+    log.info(f"Phase 1: 纯重建预热 ({recon_warmup} epochs)")
+    log.info(f"  只训练 Recon + z方差正则化, 不加 MMD/ADV")
+    log.info("=" * 60)
     
-    # 保存全局统计量到 checkpoint
-    global_stats = {'mean': global_mean, 'std': global_std}
+    best_loss = float('inf')
     
-    # 训练
-    log.info("\n开始训练...")
-    log.info(f"学习率 warmup: {warmup_epochs} epochs")
-    log.info("-" * 60)
+    warmup_lambdas = {
+        'recon': LAMBDAS['recon'],
+        'mmd': 0.0,
+        'adv': 0.0,
+        'var': args.lambda_var,
+    }
     
-    # ===== 自动 Lambda 校准 =====
-    if args.auto_lambda and LAMBDAS['mmd'] == 0.0:
+    for epoch in range(1, recon_warmup + 1):
+        log.info(f"\n=== [Phase 1] Epoch {epoch}/{recon_warmup} ===")
+        
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, epoch, warmup_lambdas)
+        
+        log.info(
+            f"Epoch {epoch} 完成: "
+            f"Loss={train_metrics['loss']:.8f}, "
+            f"Recon={train_metrics['recon']:.8f}, "
+            f"z_var={train_metrics['z_var']:.6f}"
+        )
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        log.info(f"Learning Rate: {current_lr:.6f}")
+    
+    log.info(f"\n✅ Phase 1 完成! Recon={train_metrics['recon']:.8f}, z_var={train_metrics['z_var']:.6f}")
+    
+    # ============================================================
+    # Phase 2: 自动 Lambda 校准 (在训练好的 AE 上测量)
+    # ============================================================
+    if args.auto_lambda and target_lambda_mmd == 0.0:
         log.info("\n" + "=" * 60)
-        log.info("★ 自动 Lambda 校准 (跑 1 轮测量各 loss 量级)")
+        log.info("Phase 2: 自动 Lambda 校准")
+        log.info("  在训练好的 autoencoder 上测量各 loss 量级")
         log.info("=" * 60)
         
         model.train()
@@ -552,8 +595,7 @@ def main():
         n_cal = 0
         
         for batch_idx, domain_batches in enumerate(train_loader):
-            all_counts = []
-            all_domains = []
+            all_counts, all_domains = [], []
             for domain_id, (counts, domains) in enumerate(domain_batches):
                 all_counts.append(counts)
                 all_domains.append(torch.full((counts.size(0),), domain_id, dtype=torch.long))
@@ -563,70 +605,93 @@ def main():
             
             with torch.no_grad():
                 losses = model.compute_loss(x, domain_labels,
-                                          weight_recon=1.0, weight_mmd=1.0, weight_adv=1.0)
+                                          weight_recon=1.0, weight_mmd=1.0, weight_adv=1.0, weight_var=0.0)
             
             recon_sum += losses['recon'].item()
             mmd_sum += losses['mmd'].item()
             adv_sum += losses['adv'].item()
             n_cal += 1
             
-            if n_cal >= 50:  # 只需 50 个 batch 就够了
+            if n_cal >= 100:
                 break
         
         avg_recon = recon_sum / n_cal
         avg_mmd = mmd_sum / n_cal
         avg_adv = adv_sum / n_cal
         
-        log.info(f"\n  原始量级 (λ=1.0):")
+        log.info(f"\n  原始量级 (在训练好的 AE 上):")
         log.info(f"    Recon = {avg_recon:.10f}")
         log.info(f"    MMD   = {avg_mmd:.10f}")
         log.info(f"    Adv   = {avg_adv:.10f}")
         
-        # 计算使 MMD 与 Recon 等量级的 lambda
         if avg_mmd > 1e-15:
-            auto_lambda_mmd = (avg_recon / avg_mmd) * args.mmd_target_ratio
+            target_lambda_mmd = (avg_recon / avg_mmd) * args.mmd_target_ratio
         else:
-            auto_lambda_mmd = 1000.0
-            log.info("  ⚠️ MMD 太小，使用默认 lambda_mmd=1000")
+            target_lambda_mmd = 1000.0
+            log.info("  ⚠️ MMD 仍然太小，使用默认 lambda_mmd=1000")
         
-        LAMBDAS['mmd'] = auto_lambda_mmd
+        LAMBDAS['mmd'] = target_lambda_mmd
         
         log.info(f"\n  ★ 自动校准 λ_mmd = {LAMBDAS['mmd']:.2f}")
-        log.info(f"    (使 λ_mmd × MMD ≈ {args.mmd_target_ratio} × Recon)")
         log.info(f"    校准后等效: Recon={avg_recon:.8f}, "
-                 f"MMD_weighted={LAMBDAS['mmd'] * avg_mmd:.8f}, "
-                 f"Adv_weighted={LAMBDAS['adv'] * avg_adv:.8f}")
+                 f"MMD_weighted={LAMBDAS['mmd'] * avg_mmd:.8f}")
         log.info("=" * 60)
-    elif LAMBDAS['mmd'] == 0.0:
-        LAMBDAS['mmd'] = 10.0  # 如果没开 auto 但也没设值，用安全默认
-        log.info(f"\nλ_mmd 未设置，使用默认值: {LAMBDAS['mmd']}")
+    elif target_lambda_mmd == 0.0:
+        LAMBDAS['mmd'] = 10.0
+        target_lambda_mmd = 10.0
     
-    log.info(f"\n最终 Lambda: recon={LAMBDAS['recon']}, mmd={LAMBDAS['mmd']:.2f}, adv={LAMBDAS['adv']}")
+    # ============================================================
+    # Phase 3: 域对齐 (线性 ramp-up MMD/ADV)
+    # ============================================================
+    align_epochs = NUM_EPOCHS - recon_warmup
     
-    best_loss = float('inf')
+    log.info("\n" + "=" * 60)
+    log.info(f"Phase 3: 域对齐训练 ({align_epochs} epochs)")
+    log.info(f"  λ_mmd: 0 → {target_lambda_mmd:.2f} (线性 ramp-up {rampup_epochs} epochs)")
+    log.info(f"  λ_adv: 0 → {LAMBDAS['adv']}")
+    log.info("=" * 60)
     
-    for epoch in range(1, NUM_EPOCHS + 1):
-        log.info(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
+    for epoch in range(1, align_epochs + 1):
+        global_epoch = recon_warmup + epoch
         
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, epoch, LAMBDAS)
+        # 线性 ramp-up
+        if epoch <= rampup_epochs:
+            ramp = epoch / rampup_epochs
+        else:
+            ramp = 1.0
+        
+        epoch_lambdas = {
+            'recon': LAMBDAS['recon'],
+            'mmd': target_lambda_mmd * ramp,
+            'adv': LAMBDAS['adv'] * ramp,
+            'var': args.lambda_var,
+        }
+        
+        log.info(f"\n=== [Phase 3] Epoch {global_epoch}/{NUM_EPOCHS} (ramp={ramp:.2f}) ===")
+        log.info(f"  λ: recon={epoch_lambdas['recon']}, mmd={epoch_lambdas['mmd']:.2f}, "
+                 f"adv={epoch_lambdas['adv']:.3f}, var={epoch_lambdas['var']}")
+        
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, global_epoch, epoch_lambdas)
         
         log.info(
-            f"Epoch {epoch} 完成: "
+            f"Epoch {global_epoch} 完成: "
             f"Loss={train_metrics['loss']:.8f}, "
             f"Recon={train_metrics['recon']:.8f}, "
             f"MMD={train_metrics['mmd']:.8f}, "
-            f"Adv={train_metrics['adv']:.8f}"
+            f"Adv={train_metrics['adv']:.8f}, "
+            f"z_var={train_metrics['z_var']:.6f}"
         )
         
-        scheduler.step()
-        log.info(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        scheduler.step(train_metrics['recon'])
+        current_lr = optimizer.param_groups[0]['lr']
+        log.info(f"Learning Rate: {current_lr:.6f}")
         
         checkpoint_data = {
-            'epoch': epoch,
+            'epoch': global_epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': train_metrics['loss'],
-            'lambdas': LAMBDAS,
+            'lambdas': {**LAMBDAS, 'mmd': target_lambda_mmd},
             'exp_name': EXP_NAME,
             'latent_dim': LATENT_DIM,
             'version': 'v3',
@@ -639,14 +704,17 @@ def main():
             torch.save(checkpoint_data, os.path.join(CHECKPOINT_DIR, 'best_model.pt'))
             log.info(f"保存最佳模型")
         
-        if epoch % 10 == 0:
-            torch.save(checkpoint_data, os.path.join(CHECKPOINT_DIR, f'model_epoch_{epoch}.pt'))
-            log.info(f"保存检查点: epoch {epoch}")
+        if global_epoch % 20 == 0:
+            torch.save(checkpoint_data, os.path.join(CHECKPOINT_DIR, f'model_epoch_{global_epoch}.pt'))
+            log.info(f"保存检查点: epoch {global_epoch}")
+    
+    # 保存最终模型
+    torch.save(checkpoint_data, os.path.join(CHECKPOINT_DIR, 'final_model.pt'))
     
     log.info("\n" + "=" * 60)
     log.info("✅ 训练完成!")
     log.info(f"实验: {EXP_NAME}")
-    log.info(f"Lambda: recon={LAMBDAS['recon']}, mmd={LAMBDAS['mmd']}, adv={LAMBDAS['adv']}")
+    log.info(f"Lambda: recon={LAMBDAS['recon']}, mmd={target_lambda_mmd:.2f}, adv={LAMBDAS['adv']}")
     log.info(f"最佳 Loss: {best_loss:.4f}")
     log.info(f"检查点: {CHECKPOINT_DIR}")
     log.info("=" * 60)
@@ -657,3 +725,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
