@@ -28,6 +28,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# Force DejaVu Sans font (available on this server)
+plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
 # ============================================================================
 # Config
 # ============================================================================
