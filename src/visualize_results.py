@@ -100,7 +100,7 @@ def plot_metric_bars(results, output_path):
     ]
     
     fig, axes = plt.subplots(1, 5, figsize=(24, 6))
-    fig.suptitle('MMD-AAE 实验对比 — 各指标柱状图', fontsize=16, fontweight='bold', y=1.02)
+    fig.suptitle('MMD-AAE Experiment Comparison', fontsize=16, fontweight='bold', y=1.02)
     
     for idx, (key, title, subtitle, lower_better) in enumerate(metrics):
         ax = axes[idx]
@@ -131,10 +131,10 @@ def plot_metric_bars(results, output_path):
         
         # 理想线
         if key == 'domain_cls_acc':
-            ax.axvline(x=1/3, color='green', linestyle='--', alpha=0.5, label='理想=33.3%')
+            ax.axvline(x=1/3, color='green', linestyle='--', alpha=0.5, label='ideal=33.3%')
             ax.legend(fontsize=8)
         elif key == 'silhouette_score':
-            ax.axvline(x=0, color='green', linestyle='--', alpha=0.5, label='理想=0')
+            ax.axvline(x=0, color='green', linestyle='--', alpha=0.5, label='ideal=0')
             ax.legend(fontsize=8)
         
         ax.grid(axis='x', alpha=0.2)
@@ -189,7 +189,7 @@ def plot_radar(results, output_path):
         ax.fill(angles, values, alpha=0.08, color=color)
     
     ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.15), fontsize=9)
-    ax.set_title('实验综合对比 (外圈=更好)', fontsize=14, fontweight='bold', pad=20)
+    ax.set_title('Experiment Comparison (outer = better)', fontsize=14, fontweight='bold', pad=20)
     
     fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
@@ -203,7 +203,7 @@ def plot_lambda_vs_metrics(results, output_path):
     """Lambda 值与各指标的关系"""
     
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('λ_mmd 对域对齐指标的影响', fontsize=14, fontweight='bold')
+    fig.suptitle('Effect of lambda_mmd on Domain Alignment', fontsize=14, fontweight='bold')
     
     lambdas = []
     for r in results:
@@ -214,9 +214,9 @@ def plot_lambda_vs_metrics(results, output_path):
             lambdas.append(0)
     
     metrics = [
-        ('domain_cls_acc', 'Domain Cls Acc', '越低越好'),
-        ('silhouette_score', 'Silhouette Score', '越接近0越好'),
-        ('recon_mse', 'Recon MSE', '不应太高'),
+        ('domain_cls_acc', 'Domain Cls Acc', 'lower=better'),
+        ('silhouette_score', 'Silhouette Score', 'closer to 0=better'),
+        ('recon_mse', 'Recon MSE', 'lower=better'),
     ]
     
     for idx, (key, title, note) in enumerate(metrics):
@@ -235,7 +235,7 @@ def plot_lambda_vs_metrics(results, output_path):
         ax.grid(alpha=0.3)
         
         if key == 'domain_cls_acc':
-            ax.axhline(y=1/3, color='green', linestyle='--', alpha=0.5, label='理想=33.3%')
+            ax.axhline(y=1/3, color='green', linestyle='--', alpha=0.5, label='ideal=33.3%')
             ax.legend()
     
     plt.tight_layout()
@@ -248,7 +248,7 @@ def plot_lambda_vs_metrics(results, output_path):
 # 图 4: 排行总结卡片
 # ============================================================================
 def plot_summary_card(results, output_path):
-    """生成结果总结卡片"""
+    """Generate summary ranking card"""
     
     # 排序
     sorted_results = sorted(results, key=lambda x: safe_val(x, 'domain_cls_acc', 1.0))
@@ -257,9 +257,9 @@ def plot_summary_card(results, output_path):
     ax.axis('off')
     
     # 标题
-    ax.text(0.5, 0.98, 'MMD-AAE 实验排行榜', fontsize=18, fontweight='bold',
+    ax.text(0.5, 0.98, 'MMD-AAE Experiment Ranking', fontsize=18, fontweight='bold',
             ha='center', va='top', transform=ax.transAxes)
-    ax.text(0.5, 0.93, '按 Domain Classification Accuracy 排序 (越低=域对齐越好)',
+    ax.text(0.5, 0.93, 'Sorted by Domain Classification Accuracy (lower = better alignment)',
             fontsize=11, ha='center', va='top', transform=ax.transAxes, color='gray')
     
     # 表格
@@ -271,7 +271,7 @@ def plot_summary_card(results, output_path):
     for c, x in zip(cols, col_x):
         ax.text(x, y, c, fontsize=10, fontweight='bold', va='center', transform=ax.transAxes)
     y -= 0.04
-    ax.axhline(y=y, xmin=0.02, xmax=0.95, color='gray', linewidth=0.5, transform=ax.transAxes)
+    ax.plot([0.02, 0.95], [y, y], color='gray', linewidth=0.5, transform=ax.transAxes, clip_on=False)
     y -= 0.03
     
     medals = ['🥇', '🥈', '🥉']
@@ -303,7 +303,7 @@ def plot_summary_card(results, output_path):
     
     fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
-    print(f"  ✅ 排行卡片: {output_path}")
+    print(f"  Done: summary card -> {output_path}")
 
 
 # ============================================================================
@@ -468,7 +468,7 @@ def main():
     args = parse_args()
     
     print("=" * 60)
-    print("MMD-AAE 结果可视化")
+    print("MMD-AAE Result Visualization")
     print("=" * 60)
     
     # 只做 t-SNE
