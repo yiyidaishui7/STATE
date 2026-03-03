@@ -402,7 +402,7 @@ def plot_tsne(exp_name, output_path):
     labels = np.array(all_labels)
     
     print(f"  t-SNE on {len(z_all)} samples, dim={z_all.shape[1]}...")
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
     z_2d = tsne.fit_transform(z_all)
     
     # Plot
