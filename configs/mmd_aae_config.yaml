@@ -17,7 +17,7 @@ experiment:
   num_nodes: 1
   num_gpus_per_node: 1
   port: 12400
-  val_check_interval: 1000
+  val_check_interval: 500
   limit_val_batches: 100
   ddp_timeout: 3600
   checkpoint:
