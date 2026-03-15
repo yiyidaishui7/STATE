@@ -344,10 +344,18 @@ class VCIDatasetSentenceCollator(object):
                 # we don't have a config for training
                 self.valid_gene_mask = None
 
-            self.dataset_to_protein_embeddings = torch.load(
-                utils.get_embedding_cfg(self.cfg).ds_emb_mapping.format(utils.get_embedding_cfg(self.cfg).size),
-                weights_only=False,
-            )
+            ds_emb_mapping_path = utils.get_embedding_cfg(self.cfg).ds_emb_mapping
+            if ds_emb_mapping_path is not None:
+                self.dataset_to_protein_embeddings = torch.load(
+                    ds_emb_mapping_path.format(utils.get_embedding_cfg(self.cfg).size),
+                    weights_only=False,
+                )
+            else:
+                # No explicit mapping — create identity mapping for all datasets
+                # Each dataset maps gene index i → embedding index i
+                num_genes = utils.get_embedding_cfg(self.cfg).num
+                identity_map = torch.arange(num_genes, dtype=torch.long)
+                self.dataset_to_protein_embeddings = {"default": identity_map}
 
         self.global_size = utils.get_embedding_cfg(self.cfg).num
         self.global_to_local = {}
