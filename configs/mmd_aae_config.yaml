@@ -34,8 +34,8 @@ embeddings:
   current: competition
   competition:
     all_embeddings: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/ESM2_pert_features.pt
-    ds_emb_mapping: null
-    valid_genes_masks: null
+    ds_emb_mapping: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/ds_emb_mapping_competition.torch
+    valid_genes_masks: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/valid_genes_masks_competition.torch
     size: 5120
     num: 19790
 
