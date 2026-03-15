@@ -31,8 +31,8 @@ from ..utils import get_latest_checkpoint, get_embedding_cfg, get_dataset_cfg
 class ParallelZipLoader:
     """
     并行混合加载器：用于 MMD-AAE 多域训练。
-    同时从三个 DataLoader 中各取一个 Batch。
-    返回格式: (batch_k562, batch_rpe1, batch_jurkat)
+    同时从三个 DataLoader 中各取一个 Batch，
+    合并为单个 batch 并附加域标签 (batch[9])。
     """
     def __init__(self, loaders, domain_names=None):
         self.loaders = loaders
@@ -40,7 +40,46 @@ class ParallelZipLoader:
         self._datasets = [loader.dataset for loader in loaders]
     
     def __iter__(self):
-        return zip(*self.loaders)
+        for batches in zip(*self.loaders):
+            yield self._merge_batches(batches)
+    
+    @staticmethod
+    def _merge_batches(batches):
+        """
+        Merge N domain batches into a single batch, appending domain labels as batch[9].
+        Each batch is a tuple of tensors (or None). We concatenate along dim=0.
+        """
+        num_fields = len(batches[0])
+        merged = []
+        domain_labels_list = []
+        
+        for field_idx in range(num_fields):
+            field_items = [b[field_idx] for b in batches]
+            if field_items[0] is None:
+                merged.append(None)
+            elif isinstance(field_items[0], torch.Tensor):
+                merged.append(torch.cat(field_items, dim=0))
+                if field_idx == 0:  # count batch sizes from the first tensor
+                    for domain_id, item in enumerate(field_items):
+                        domain_labels_list.append(
+                            torch.full((item.size(0),), domain_id, dtype=torch.long)
+                        )
+            else:
+                # For non-tensor fields, just concatenate as lists
+                merged.append(field_items[0])
+        
+        # Append domain labels as batch[9]
+        # Pad merged to ensure it has at least 10 elements
+        while len(merged) < 9:
+            merged.append(None)
+        
+        if domain_labels_list:
+            domain_labels = torch.cat(domain_labels_list, dim=0)
+        else:
+            domain_labels = None
+        merged.append(domain_labels)
+        
+        return tuple(merged)
     
     def __len__(self):
         return min(len(l) for l in self.loaders)
@@ -159,45 +198,47 @@ def create_domain_dataloaders(cfg, DatasetClass, collator, batch_size=32, num_wo
 
 
 def verify_parallel_dataloader(train_dataloader):
-    """验证并行 DataLoader 输出格式"""
+    """验证并行 DataLoader 输出格式 (merged batch with domain labels)"""
     print("\n" + "="*60)
-    print("正在验证 DataLoader 输出格式...")
+    print("Verifying merged DataLoader output format...")
     print("="*60)
     
     try:
         # 取一个 batch
         test_batch = next(iter(train_dataloader))
         
-        print(f"\nBatch 基本信息:")
-        print(f"  - Batch 类型: {type(test_batch)}")
-        print(f"  - Batch 长度: {len(test_batch)} (应该等于 3)")
+        print(f"\nMerged batch info:")
+        print(f"  - Type: {type(test_batch)}")
+        print(f"  - Fields: {len(test_batch)}")
         
-        # 验证每个域的数据
-        for i, (batch, domain_name) in enumerate(zip(test_batch, train_dataloader.domain_names)):
-            print(f"\n  [{domain_name}] 数据:")
-            
-            if isinstance(batch, tuple):
-                print(f"    元素数: {len(batch)}")
-                for j, item in enumerate(batch):
-                    if item is None:
-                        print(f"    [{j}]: None")
-                    elif isinstance(item, torch.Tensor):
-                        print(f"    [{j}]: Tensor shape={item.shape}, dtype={item.dtype}")
-                    else:
-                        print(f"    [{j}]: {type(item)}")
-            elif isinstance(batch, dict):
-                print(f"    Keys: {list(batch.keys())}")
+        for j, item in enumerate(test_batch):
+            if item is None:
+                print(f"  [{j}]: None")
+            elif isinstance(item, torch.Tensor):
+                print(f"  [{j}]: Tensor shape={item.shape}, dtype={item.dtype}")
             else:
-                print(f"    类型: {type(batch)}")
+                print(f"  [{j}]: {type(item)}")
+        
+        # Verify domain labels at batch[9]
+        if len(test_batch) > 9 and test_batch[9] is not None:
+            domain_labels = test_batch[9]
+            print(f"\n  Domain labels (batch[9]):")
+            print(f"    shape={domain_labels.shape}")
+            print(f"    unique values={domain_labels.unique().tolist()}")
+            for d in domain_labels.unique():
+                cnt = (domain_labels == d).sum().item()
+                print(f"    domain {d.item()}: {cnt} samples")
+        else:
+            print("\n  WARNING: No domain labels found at batch[9]")
         
         print("\n" + "="*60)
-        print("✅ 验证通过! DataLoader 已成功并行化。")
+        print("Verification passed!")
         print("="*60 + "\n")
         
         return True
         
     except Exception as e:
-        print(f"\n❌ 验证失败: {e}")
+        print(f"\nVerification failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -254,10 +295,9 @@ def main(cfg):
     # 以下为测试模式 - 验证成功后可注释掉 exit() 继续训练
     # ====================================================================
     print("\n" + "="*60)
-    print("🎉 DataLoader 测试成功!")
-    print("下一步: 注释掉下面的 return 语句以继续完整训练")
+    print("DataLoader test passed!")
     print("="*60 + "\n")
-    return  # <-- 验证成功后注释掉这行
+    # return  # <-- Removed: proceed to full training
     
     # ====================================================================
     # 创建 Validation DataLoader (使用原始配置)

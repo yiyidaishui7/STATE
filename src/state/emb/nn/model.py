@@ -29,6 +29,21 @@ from .loss import WassersteinLoss, KLDivergenceLoss, MMDLoss, TabularLoss
 
 from .flash_transformer import FlashTransformerEncoderLayer
 from .flash_transformer import FlashTransformerEncoder
+from torch.autograd import Function
+
+
+# ============================================================================
+# Gradient Reversal Layer (for adversarial domain alignment)
+# ============================================================================
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
 
 
 class SkipBlock(nn.Module):
@@ -170,6 +185,26 @@ class StateEmbeddingModel(L.LightningModule):
             self.dataset_loss = nn.CrossEntropyLoss()
         else:
             self.dataset_token = None
+
+        # ================================================================
+        # Domain Alignment (MMD + Adversarial)
+        # ================================================================
+        self.domain_alignment = getattr(self.cfg.model, "domain_alignment", False)
+        if self.domain_alignment:
+            num_domains = getattr(self.cfg.model, "num_domains", 3)
+            self.domain_disc = nn.Sequential(
+                nn.Linear(output_dim, 256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, 256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, num_domains),
+            )
+            self.mmd_weight = getattr(self.cfg.model, "mmd_weight", 2.0)
+            self.adv_weight = getattr(self.cfg.model, "adv_weight", 0.1)
+            self.alignment_warmup_epochs = getattr(self.cfg.model, "alignment_warmup", 5)
+            self.domain_adv_loss = nn.CrossEntropyLoss()
 
     def on_save_checkpoint(self, checkpoint):
         """
@@ -360,6 +395,56 @@ class StateEmbeddingModel(L.LightningModule):
         self.log(f"{prefix}/avg_nonzero_genes", avg_nonzero)
         self.log(f"{prefix}/nonzero_fraction", nonzero_fraction)
 
+    # ================================================================
+    # Domain alignment helpers
+    # ================================================================
+    def _compute_pairwise_mmd(self, embeddings, domain_labels):
+        """Compute pairwise MMD between all domain pairs on CLS embeddings."""
+        unique_domains = domain_labels.unique()
+        if len(unique_domains) < 2:
+            return torch.tensor(0.0, device=embeddings.device)
+
+        mmd_total = torch.tensor(0.0, device=embeddings.device)
+        n_pairs = 0
+        for i in range(len(unique_domains)):
+            for j in range(i + 1, len(unique_domains)):
+                mask_i = domain_labels == unique_domains[i]
+                mask_j = domain_labels == unique_domains[j]
+                x = embeddings[mask_i]
+                y = embeddings[mask_j]
+                if len(x) < 2 or len(y) < 2:
+                    continue
+                mmd_total = mmd_total + self._rbf_mmd(x, y)
+                n_pairs += 1
+
+        return mmd_total / max(n_pairs, 1)
+
+    @staticmethod
+    def _rbf_mmd(x, y, sigmas=[0.1, 1.0, 10.0]):
+        """Multi-scale RBF kernel MMD^2."""
+        xx = torch.cdist(x, x, p=2).pow(2)
+        yy = torch.cdist(y, y, p=2).pow(2)
+        xy = torch.cdist(x, y, p=2).pow(2)
+
+        mmd = torch.tensor(0.0, device=x.device)
+        for sigma in sigmas:
+            gamma = 1.0 / (2 * sigma ** 2)
+            mmd = mmd + torch.exp(-gamma * xx).mean()
+            mmd = mmd + torch.exp(-gamma * yy).mean()
+            mmd = mmd - 2 * torch.exp(-gamma * xy).mean()
+        return mmd / len(sigmas)
+
+    def _get_alignment_alpha(self):
+        """Warmup schedule: 0 during warmup, linear ramp to 1.0."""
+        if not hasattr(self, 'trainer') or self.trainer is None:
+            return 0.0
+        current_epoch = self.current_epoch
+        if current_epoch < self.alignment_warmup_epochs:
+            return 0.0
+        ramp_epochs = 5  # ramp up over 5 epochs after warmup
+        progress = min((current_epoch - self.alignment_warmup_epochs) / max(ramp_epochs, 1), 1.0)
+        return progress
+
     def shared_step(self, batch, batch_idx):
         logging.info(f"Step {self.global_step} - Batch {batch_idx}")
         X, Y, batch_weights, embs, dataset_embs = self._compute_embedding_for_batch(batch)
@@ -438,6 +523,31 @@ class StateEmbeddingModel(L.LightningModule):
                 loss = loss + dataset_loss
             else:
                 self.log("validation/dataset_loss", dataset_loss)
+
+        # ================================================================
+        # Domain alignment loss (MMD + Adversarial) on CLS embeddings
+        # ================================================================
+        domain_labels = batch[9] if len(batch) > 9 else None
+        if self.domain_alignment and domain_labels is not None and self.training:
+            domain_labels = domain_labels.to(self.device).long()
+            alpha = self._get_alignment_alpha()
+
+            if alpha > 0:
+                # MMD loss on CLS embeddings
+                mmd_loss = self._compute_pairwise_mmd(embs, domain_labels)
+                # Adversarial loss with gradient reversal
+                reversed_embs = GradientReversalFunction.apply(embs, alpha)
+                domain_pred = self.domain_disc(reversed_embs)
+                adv_loss = self.domain_adv_loss(domain_pred, domain_labels)
+
+                alignment_loss = self.mmd_weight * alpha * mmd_loss + self.adv_weight * alpha * adv_loss
+                loss = loss + alignment_loss
+
+                # Log alignment metrics
+                self.log("trainer/mmd_loss", mmd_loss)
+                self.log("trainer/adv_loss", adv_loss)
+                self.log("trainer/alignment_alpha", alpha)
+                self.log("trainer/alignment_loss", alignment_loss)
 
         sch = self.lr_schedulers()
 

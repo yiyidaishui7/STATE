@@ -76,6 +76,12 @@ model:
   ema_decay: 0.999
   num_downsample: 1
   variable_masking: true
+  # Domain alignment (MMD + Adversarial)
+  domain_alignment: true
+  mmd_weight: 2.0            # optimal from standalone r5 experiment
+  adv_weight: 0.1
+  alignment_warmup: 5        # epochs of pure prediction before alignment
+  num_domains: 3             # K562, RPE1, Jurkat
 
 optimizer:
   max_lr: 1.0e-05
