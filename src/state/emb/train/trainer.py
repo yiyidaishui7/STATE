@@ -275,12 +275,13 @@ def main(cfg):
     # ====================================================================
     # 创建三路并行 DataLoader (MMD-AAE)
     # ====================================================================
+    per_domain_bs = max(1, cfg.model.batch_size // 3)  # e.g. 64//3=21 per domain
     train_dataloader = create_domain_dataloaders(
         cfg, 
         DatasetClass, 
         train_collator,
-        batch_size=32,   # 每个域 32，总共 96
-        num_workers=2
+        batch_size=per_domain_bs,
+        num_workers=cfg.dataset.num_train_workers,
     )
     
     # 验证 DataLoader
