@@ -22,6 +22,7 @@ H5_FILES = {
     "K562":   f"{BASE_DIR}/competition_support_set/k562.h5",
     "RPE1":   f"{BASE_DIR}/competition_support_set/rpe1.h5",
     "Jurkat": f"{BASE_DIR}/competition_support_set/jurkat.h5",
+    "hepg2":  f"{BASE_DIR}/competition_support_set/hepg2.h5",
 }
 
 
