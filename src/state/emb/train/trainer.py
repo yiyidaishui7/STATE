@@ -109,20 +109,11 @@ def get_embeddings(cfg):
 
 def create_domain_dataloaders(cfg, DatasetClass, collator, batch_size=32, num_workers=2):
     """
-    创建三路并行 DataLoader
-    
-    Args:
-        cfg: 配置对象
-        DatasetClass: Dataset 类
-        collator: Collator 函数
-        batch_size: 每个域的 batch_size
-        num_workers: DataLoader workers 数量
-    
-    Returns:
-        ParallelZipLoader 实例
+    Create parallel DataLoaders for 3 cell-line domains.
+    Reads h5 files directly to get shapes, bypassing CSV-based get_shapes_dict.
     """
+    import h5py
     
-    # 三个细胞系的数据路径 (服务器路径)
     BASE_DIR = "/media/mldadmin/home/s125mdg34_03/state"
     domain_configs = [
         {"name": "K562",   "path": f"{BASE_DIR}/competition_support_set/k562.h5"},
@@ -134,35 +125,44 @@ def create_domain_dataloaders(cfg, DatasetClass, collator, batch_size=32, num_wo
     domain_names = []
     
     print(f"\n{'='*60}")
-    print(f"[MMD-AAE] 开始初始化 3 路并行 DataLoaders...")
+    print(f"[MMD-AAE] Initializing 3-way parallel DataLoaders...")
     print(f"{'='*60}")
     
     for domain in domain_configs:
         name = domain["name"]
         path = domain["path"]
         
-        print(f"\n正在加载 {name}...")
-        print(f"  路径: {path}")
+        print(f"\nLoading {name}...")
+        print(f"  path: {path}")
         
-        # 检查文件是否存在
         if not os.path.exists(path):
-            raise FileNotFoundError(f"数据文件不存在: {path}")
+            raise FileNotFoundError(f"Data file not found: {path}")
         
-        # 克隆配置，避免相互污染
-        dom_cfg = copy.deepcopy(cfg)
+        # Read shape from h5 file directly
+        with h5py.File(path, "r") as h5f:
+            attrs = dict(h5f["X"].attrs)
+            if "shape" in attrs:
+                n_cells, n_genes = attrs["shape"]
+            elif attrs.get("encoding-type") == "csr_matrix":
+                n_cells = h5f["X"]["indptr"].shape[0] - 1
+                n_genes = attrs.get("shape", [n_cells, 18080])[1] if "shape" in attrs else 18080
+            else:
+                shape = h5f["X"].shape
+                n_cells, n_genes = shape[0], shape[1]
+            n_cells, n_genes = int(n_cells), int(n_genes)
         
-        # 修改数据路径
-        # 根据配置结构，设置正确的路径属性
-        ds_cfg = get_dataset_cfg(dom_cfg)
-        # 设置 train 路径为当前域的数据文件
-        ds_cfg.train = path
+        print(f"  shape: ({n_cells}, {n_genes})")
+        
+        # Construct dataset using datasets/shape_dict path (bypasses CSV)
+        datasets_list = [name]
+        shape_dict = {name: (n_cells, n_genes)}
         
         try:
-            # 创建 Dataset
-            dom_dataset = DatasetClass(dom_cfg)
-            print(f"  ✓ Dataset 创建成功, 样本数: {len(dom_dataset)}")
+            dom_dataset = DatasetClass(cfg, datasets=datasets_list, shape_dict=shape_dict)
+            # Manually set dataset_path_map so dataset_file() can find the h5
+            dom_dataset.dataset_path_map = {name: path}
+            print(f"  OK: Dataset created, {len(dom_dataset)} samples")
             
-            # 创建 DataLoader
             loader = DataLoader(
                 dom_dataset,
                 batch_size=batch_size,
@@ -171,27 +171,25 @@ def create_domain_dataloaders(cfg, DatasetClass, collator, batch_size=32, num_wo
                 num_workers=num_workers,
                 persistent_workers=True if num_workers > 0 else False,
                 pin_memory=True,
-                drop_last=True  # 必须开启，防止尾部数据对不齐
+                drop_last=True
             )
             parallel_loaders.append(loader)
             domain_names.append(name)
-            print(f"  ✓ DataLoader 创建成功")
             
         except Exception as e:
-            print(f"  ✗ 创建失败: {e}")
+            print(f"  FAIL: {e}")
             import traceback
             traceback.print_exc()
             raise
     
-    # 封装成并行加载器
     train_dataloader = ParallelZipLoader(parallel_loaders, domain_names)
     
     print(f"\n{'='*60}")
-    print(f"[MMD-AAE] 并行加载器构建完成!")
-    print(f"  - 成功加载的域: {domain_names}")
-    print(f"  - 每个域 Batch Size: {batch_size}")
-    print(f"  - 总 Batch Size: {train_dataloader.batch_size}")
-    print(f"  - 每轮迭代次数: {len(train_dataloader)}")
+    print(f"[MMD-AAE] Parallel loader ready!")
+    print(f"  domains: {domain_names}")
+    print(f"  per-domain batch: {batch_size}")
+    print(f"  total batch: {train_dataloader.batch_size}")
+    print(f"  iterations/epoch: {len(train_dataloader)}")
     print(f"{'='*60}\n")
     
     return train_dataloader
