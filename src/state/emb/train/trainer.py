@@ -420,7 +420,7 @@ def main(cfg):
         precision="bf16-mixed",
         strategy=DDPStrategy(
             process_group_backend="nccl",
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
         ),
         val_check_interval=val_interval,
