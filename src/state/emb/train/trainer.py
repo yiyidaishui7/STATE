@@ -300,7 +300,25 @@ def main(cfg):
     # ====================================================================
     # 创建 Validation DataLoader (使用原始配置)
     # ====================================================================
-    val_dataset = DatasetClass(cfg, test=True)
+    # Build val dataset from h5 directly (same approach as train)
+    import h5py as h5py_val
+    val_path = get_dataset_cfg(cfg).val
+    with h5py_val.File(val_path, "r") as vf:
+        vattrs = dict(vf["X"].attrs)
+        if "shape" in vattrs:
+            vn_cells, vn_genes = int(vattrs["shape"][0]), int(vattrs["shape"][1])
+        elif vattrs.get("encoding-type") in ("csr_matrix", "csc_matrix"):
+            vn_cells = vf["X"]["indptr"].shape[0] - 1
+            vn_genes = int(vattrs["shape"][1]) if "shape" in vattrs else 18080
+        else:
+            vn_cells, vn_genes = vf["X"].shape[0], vf["X"].shape[1]
+    
+    # Derive a dataset name from the filename
+    val_name = os.path.splitext(os.path.basename(val_path))[0]
+    val_dataset = DatasetClass(cfg, test=True, datasets=[val_name], shape_dict={val_name: (vn_cells, vn_genes)})
+    val_dataset.dataset_path_map = {val_name: val_path}
+    print(f"Val dataset: {val_name}, shape=({vn_cells}, {vn_genes})")
+    
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=cfg.model.batch_size,
