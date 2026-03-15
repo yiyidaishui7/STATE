@@ -530,7 +530,12 @@ class VCIDatasetSentenceCollator(object):
         original_counts_raw = counts_raw.clone()
 
         # logic to sample a single cell sentence and task sentence here
-        ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings[dataset], dtype=torch.long)
+        if dataset in self.dataset_to_protein_embeddings:
+            ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings[dataset], dtype=torch.long)
+        elif "default" in self.dataset_to_protein_embeddings:
+            ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings["default"], dtype=torch.long)
+        else:
+            raise KeyError(f"Dataset '{dataset}' not found in dataset_to_protein_embeddings")
 
         original_counts = original_counts_raw
         counts = counts_raw
