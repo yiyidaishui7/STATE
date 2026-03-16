@@ -13,7 +13,7 @@ from typing import Dict, Optional
 
 from torch.utils.data import DataLoader
 from .. import utils
-from src.state.emb.data.sampler import DomainBalancedSampler
+from .sampler import DomainBalancedSampler
 
 log = logging.getLogger(__file__)
 
