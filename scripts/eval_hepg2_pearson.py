@@ -178,7 +178,7 @@ def eval_mode_a_cell_pearson(model, cfg, h5_path, args, device):
 
             if model.z_dim_rd == 1:  # rda=True
                 # mu = mean non-zero expression of Y（对于 HepG2 零样本，用实际 Y 来计算 mu）
-                Y_float = Y.float()
+                Y_float = Y.float().to(X.device)
                 mu = torch.nan_to_num(
                     torch.nanmean(
                         Y_float.masked_fill(Y_float == 0, float("nan")), dim=1
