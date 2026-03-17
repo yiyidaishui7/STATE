@@ -162,13 +162,25 @@ def extract_cls_embeddings(model, cfg, h5_path, domain_name, max_samples, batch_
     collator = VCIDatasetSentenceCollator(cfg, is_train=False)
     collator.cfg = cfg
 
-    # Register unknown domains (e.g. HepG2) by reusing the first known domain's
-    # protein-embedding indices — all competition datasets share the same gene space.
+    # Register unknown domains (e.g. "HepG2") by aliasing from the lowercase h5-stem
+    # key (e.g. "hepg2") which exists in the competition ds_emb_mapping.  Also alias
+    # valid_gene_mask so the correct per-domain gene filter is applied.
     if domain_name not in collator.dataset_to_protein_embeddings:
-        ref = next(iter(collator.dataset_to_protein_embeddings))
-        collator.dataset_to_protein_embeddings[domain_name] = \
-            collator.dataset_to_protein_embeddings[ref]
-        collator.global_to_local[domain_name] = collator.global_to_local[ref]
+        lower = domain_name.lower()
+        if lower in collator.dataset_to_protein_embeddings:
+            collator.dataset_to_protein_embeddings[domain_name] = \
+                collator.dataset_to_protein_embeddings[lower]
+            collator.global_to_local[domain_name] = collator.global_to_local[lower]
+            if (collator.valid_gene_mask is not None
+                    and isinstance(collator.valid_gene_mask, dict)
+                    and lower in collator.valid_gene_mask):
+                collator.valid_gene_mask[domain_name] = collator.valid_gene_mask[lower]
+        else:
+            # hard fallback: borrow first registered domain's indices
+            ref = next(iter(collator.dataset_to_protein_embeddings))
+            collator.dataset_to_protein_embeddings[domain_name] = \
+                collator.dataset_to_protein_embeddings[ref]
+            collator.global_to_local[domain_name] = collator.global_to_local[ref]
 
     loader = DataLoader(
         dataset,
