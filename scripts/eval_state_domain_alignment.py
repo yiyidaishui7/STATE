@@ -40,6 +40,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from datetime import datetime
 from pathlib import Path
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -178,10 +179,11 @@ def extract_cls_embeddings(model, cfg, h5_path, domain_name, max_samples, batch_
         persistent_workers=(num_workers > 0),
     )
 
+    n_batches = (min(n_cells, max_samples) + batch_size - 1) // batch_size
     z_list = []
     total = 0
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, total=n_batches, desc=f"    {domain_name}", leave=False):
             _, _, _, emb, _ = model._compute_embedding_for_batch(batch)
             z_list.append(emb.detach().cpu().float().numpy())
             total += emb.size(0)
