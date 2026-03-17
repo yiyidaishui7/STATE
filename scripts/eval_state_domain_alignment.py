@@ -161,6 +161,14 @@ def extract_cls_embeddings(model, cfg, h5_path, domain_name, max_samples, batch_
     collator = VCIDatasetSentenceCollator(cfg, is_train=False)
     collator.cfg = cfg
 
+    # Register unknown domains (e.g. HepG2) by reusing the first known domain's
+    # protein-embedding indices — all competition datasets share the same gene space.
+    if domain_name not in collator.dataset_to_protein_embeddings:
+        ref = next(iter(collator.dataset_to_protein_embeddings))
+        collator.dataset_to_protein_embeddings[domain_name] = \
+            collator.dataset_to_protein_embeddings[ref]
+        collator.global_to_local[domain_name] = collator.global_to_local[ref]
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
