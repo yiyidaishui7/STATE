@@ -398,7 +398,8 @@ def main(cfg):
         ema_decay = getattr(cfg.model, "ema_decay", 0.999)
         callbacks.append(EMACallback(decay=ema_decay))
 
-    callbacks.append(CumulativeFLOPSCallback(use_backward=cfg.experiment.cumulative_flops_use_backward))
+    if cfg.experiment.cumulative_flops_use_backward:
+        callbacks.append(CumulativeFLOPSCallback(use_backward=True))
 
     max_steps = -1
     if cfg.experiment.profile.enable_profiler:
