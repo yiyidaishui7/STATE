@@ -1,0 +1,109 @@
+# No-MMD Baseline 训练配置
+# 与 mmd_aae_config.yaml 完全相同，唯一区别：domain_alignment: false
+# 用途：作为 STATE+MMD-AAE 的对照组，验证 MMD 域对齐的实际贡献
+# 训练命令：cd ~/state/src && python train.py --config ../configs/no_mmd_baseline_config.yaml
+
+experiment:
+  name: no_mmd_baseline          # 独立实验名，checkpoint 保存到 checkpoints/no_mmd_baseline/
+  local: local
+  compiled: false
+  deaware: false
+  cumulative_flops_use_backward: false
+  profile:
+    enable_profiler: false
+    profile_steps:
+    - 10
+    - 100
+    max_steps: 110
+  num_epochs: 16                 # 与 MMD 实验完全相同
+  num_nodes: 1
+  num_gpus_per_node: 1
+  port: 12401                    # 避免与 MMD 实验端口冲突
+  val_check_interval: 300
+  limit_val_batches: 100
+  ddp_timeout: 3600
+  checkpoint:
+    path: /media/mldadmin/home/s125mdg34_03/state/checkpoints
+    save_top_k: 4
+    monitor: trainer/train_loss
+    every_n_train_steps: 1000
+
+wandb:
+  enable: false
+  project: mmd_aae
+
+embeddings:
+  current: competition
+  competition:
+    all_embeddings: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/ESM2_pert_features.pt
+    ds_emb_mapping: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/ds_emb_mapping_competition.torch
+    valid_genes_masks: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/valid_genes_masks_competition.torch
+    size: 5120
+    num: 19790
+
+dataset:
+  name: competition
+  seed: 42                       # 与 MMD 实验相同的随机种子
+  num_train_workers: 4
+  num_val_workers: 2
+  current: competition
+  competition:
+    ds_type: h5ad
+    train: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/k562.h5
+    val: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/hepg2.h5
+    filter: false
+  pad_length: 2048
+  pad_token_idx: 0
+  cls_token_idx: 3
+  chrom_token_right_idx: 2
+  P: 512
+  'N': 512
+  S: 512
+  num_cells: 62194               # 与 MMD 实验相同的训练数据量
+
+model:
+  name: mmd_aae
+  batch_size: 48                 # 降至 16×3，24GB GPU 内存限制（原96=32×3会OOM）
+  emsize: 512
+  d_hid: 1024
+  nhead: 16
+  nlayers: 8
+  dropout: 0.1
+  output_dim: 512
+  use_flash_attention: true
+  rda: true
+  counts: true
+  dataset_correction: false
+  ema: false
+  ema_decay: 0.999
+  num_downsample: 1
+  variable_masking: true
+  # ======================================================
+  # 核心区别：关闭域对齐
+  domain_alignment: false        # ← 唯一改动
+  mmd_weight: 0.0                # 无效，domain_alignment=false 时不进入对齐分支
+  adv_weight: 0.0
+  alignment_warmup: 5
+  num_domains: 3
+  # ======================================================
+
+optimizer:
+  max_lr: 1.0e-05                # 与 MMD 实验相同
+  weight_decay: 0.01
+  start: 0.33
+  end: 1.0
+  max_grad_norm: 0.8
+  gradient_accumulation_steps: 8
+  reset_lr_on_restart: false
+
+loss:
+  name: tabular
+  apply_normalization: false
+  kernel: energy
+  uniformity: false
+
+validations:
+  diff_exp:
+    enable: false
+  perturbation:
+    enable: false
