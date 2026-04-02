@@ -4,7 +4,7 @@
 # 训练命令：cd ~/state/src && python train.py --config ../configs/no_mmd_baseline_config.yaml
 
 experiment:
-  name: no_mmd_baseline          # 独立实验名，checkpoint 保存到 checkpoints/no_mmd_baseline/
+  name: no_mmd_baseline          # Baseline: 不使用 MMD/对抗域对齐
   local: local
   compiled: false
   deaware: false
@@ -25,7 +25,7 @@ experiment:
   checkpoint:
     path: /media/mldadmin/home/s125mdg34_03/state/checkpoints
     save_top_k: 4
-    monitor: trainer/train_loss
+    monitor: validation/val_loss
     every_n_train_steps: 1000
 
 wandb:
@@ -79,9 +79,9 @@ model:
   num_downsample: 1
   variable_masking: true
   # ======================================================
-  # 核心区别：关闭域对齐
-  domain_alignment: false        # ← 唯一改动
-  mmd_weight: 0.0                # 无效，domain_alignment=false 时不进入对齐分支
+  # Baseline: 关闭域对齐
+  domain_alignment: false
+  mmd_weight: 0.0
   adv_weight: 0.0
   alignment_warmup: 5
   num_domains: 3
