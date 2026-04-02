@@ -2,11 +2,11 @@
 # 基于 state-defaults.yaml 修改
 
 experiment:
-  name: mmd_aae_pretrain
+  name: mmd_aae
   local: local
   compiled: false
   deaware: false
-  cumulative_flops_use_backward: true
+  cumulative_flops_use_backward: false
   profile:
     enable_profiler: false
     profile_steps:
@@ -17,13 +17,13 @@ experiment:
   num_nodes: 1
   num_gpus_per_node: 1
   port: 12400
-  val_check_interval: 500
+  val_check_interval: 300
   limit_val_batches: 100
   ddp_timeout: 3600
   checkpoint:
     path: /media/mldadmin/home/s125mdg34_03/state/checkpoints
     save_top_k: 4
-    monitor: trainer/train_loss
+    monitor: validation/val_loss
     every_n_train_steps: 1000
 
 wandb:
@@ -61,7 +61,7 @@ dataset:
 
 model:
   name: mmd_aae
-  batch_size: 96  # 32 * 3 domains
+  batch_size: 48  # 与 baseline 对齐，避免 24GB GPU 上 OOM
   emsize: 512
   d_hid: 1024
   nhead: 16
@@ -76,12 +76,12 @@ model:
   ema_decay: 0.999
   num_downsample: 1
   variable_masking: true
-  # Domain alignment (MMD + Adversarial)
+  # MMD-AAE: 开启域对齐
   domain_alignment: true
-  mmd_weight: 2.0            # optimal from standalone r5 experiment
+  mmd_weight: 2.0
   adv_weight: 0.1
-  alignment_warmup: 5        # epochs of pure prediction before alignment
-  num_domains: 3             # K562, RPE1, Jurkat
+  alignment_warmup: 5
+  num_domains: 3
 
 optimizer:
   max_lr: 1.0e-05
