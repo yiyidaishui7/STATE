@@ -114,12 +114,19 @@ def create_domain_dataloaders(cfg, DatasetClass, collator, batch_size=32, num_wo
     """
     import h5py
     
-    BASE_DIR = "/media/mldadmin/home/s125mdg34_03/state"
-    domain_configs = [
-        {"name": "K562",   "path": f"{BASE_DIR}/competition_support_set/k562.h5"},
-        {"name": "RPE1",   "path": f"{BASE_DIR}/competition_support_set/rpe1.h5"},
-        {"name": "Jurkat", "path": f"{BASE_DIR}/competition_support_set/jurkat.h5"},
-    ]
+    # 优先从 cfg.dataset.competition.train_domains 读取，否则回退到默认三域
+    if hasattr(cfg.dataset, 'competition') and hasattr(cfg.dataset.competition, 'train_domains'):
+        domain_configs = [
+            {"name": d.name, "path": d.path}
+            for d in cfg.dataset.competition.train_domains
+        ]
+    else:
+        BASE_DIR = "/media/mldadmin/home/s125mdg34_03/state"
+        domain_configs = [
+            {"name": "K562",   "path": f"{BASE_DIR}/competition_support_set/k562.h5"},
+            {"name": "RPE1",   "path": f"{BASE_DIR}/competition_support_set/rpe1.h5"},
+            {"name": "Jurkat", "path": f"{BASE_DIR}/competition_support_set/jurkat.h5"},
+        ]
     
     parallel_loaders = []
     domain_names = []

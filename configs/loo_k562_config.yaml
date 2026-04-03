@@ -1,0 +1,107 @@
+# Leave-One-Out: 训练 RPE1+Jurkat+HepG2，验证 K562（零样本）
+experiment:
+  name: loo_k562
+  local: local
+  compiled: false
+  deaware: false
+  cumulative_flops_use_backward: false
+  profile:
+    enable_profiler: false
+    profile_steps: [10, 100]
+    max_steps: 110
+  num_epochs: 16
+  num_nodes: 1
+  num_gpus_per_node: 1
+  port: 12405
+  val_check_interval: 300
+  limit_val_batches: 100
+  ddp_timeout: 3600
+  checkpoint:
+    path: /media/mldadmin/home/s125mdg34_03/state/checkpoints
+    save_top_k: 4
+    monitor: validation/val_loss
+    every_n_train_steps: 1000
+
+wandb:
+  enable: false
+  project: mmd_aae
+
+embeddings:
+  current: competition
+  competition:
+    all_embeddings: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/ESM2_pert_features.pt
+    ds_emb_mapping: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/ds_emb_mapping_competition.torch
+    valid_genes_masks: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/valid_genes_masks_competition.torch
+    size: 5120
+    num: 19790
+
+dataset:
+  name: competition
+  seed: 42
+  num_train_workers: 4
+  num_val_workers: 2
+  current: competition
+  competition:
+    ds_type: h5ad
+    train: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/rpe1.h5
+    val: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/k562.h5  # 零样本验证
+    filter: false
+    train_domains:
+      - name: RPE1
+        path: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/rpe1.h5
+      - name: Jurkat
+        path: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/jurkat.h5
+      - name: HepG2
+        path: /media/mldadmin/home/s125mdg34_03/state/competition_support_set/hepg2.h5
+  pad_length: 2048
+  pad_token_idx: 0
+  cls_token_idx: 3
+  chrom_token_right_idx: 2
+  P: 512
+  'N': 512
+  S: 512
+  num_cells: 62194
+
+model:
+  name: mmd_aae
+  batch_size: 48
+  emsize: 512
+  d_hid: 1024
+  nhead: 16
+  nlayers: 8
+  dropout: 0.1
+  output_dim: 512
+  use_flash_attention: true
+  rda: true
+  counts: true
+  dataset_correction: false
+  ema: false
+  ema_decay: 0.999
+  num_downsample: 1
+  variable_masking: true
+  domain_alignment: true
+  mmd_weight: 2.0
+  adv_weight: 0.1
+  alignment_warmup: 5
+  num_domains: 3
+
+optimizer:
+  max_lr: 1.0e-05
+  weight_decay: 0.01
+  start: 0.33
+  end: 1.0
+  max_grad_norm: 0.8
+  gradient_accumulation_steps: 8
+  reset_lr_on_restart: false
+
+loss:
+  name: tabular
+  apply_normalization: false
+  kernel: energy
+  uniformity: false
+
+validations:
+  diff_exp:
+    enable: false
+  perturbation:
+    enable: false
