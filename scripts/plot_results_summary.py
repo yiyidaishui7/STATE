@@ -241,7 +241,7 @@ def plot_alignment_metrics(base_align, mmd_align, output_dir):
 
     metrics_info = [
         ("DomainClsAcc", "domain_cls_acc", True,  [0.3, 1.0]),   # lower=better, range
-        ("Silhouette",   "silhouette_score", True, [0.0, 0.5]),
+        ("Silhouette",   "silhouette", True, [0.0, 0.5]),
         ("MMD (mean)",   "mmd_mean",        True,  [0.0, 0.25]),
     ]
 
@@ -366,7 +366,7 @@ def plot_summary_panel(base_pearson, mmd_pearson, base_align, mmd_align, output_
 
     align_metrics = [
         ("DomainClsAcc", "domain_cls_acc", gs[0, 2]),
-        ("Silhouette",   "silhouette_score", gs[0, 3]),
+        ("Silhouette",   "silhouette", gs[0, 3]),
         ("MMD (mean)",   "mmd_mean",        gs[1, 0]),
     ]
     for title, key, subplot_spec in align_metrics:
@@ -390,7 +390,7 @@ def plot_summary_panel(base_pearson, mmd_pearson, base_align, mmd_align, output_
         f"  STATE+MMD = {means[1]:.4f} ± {stds[1]:.4f}\n"
         f"  Δ = {means[1]-means[0]:+.4f}  (within noise, p>0.05)\n\n"
         "• MMD successfully aligns distributions:\n"
-        f"  Silhouette: {get_m(base_align,'silhouette_score'):.3f} → {get_m(mmd_align,'silhouette_score'):.3f}\n"
+        f"  Silhouette: {get_m(base_align,'silhouette'):.3f} → {get_m(mmd_align,'silhouette'):.3f}\n"
         f"  MMD: {get_m(base_align,'mmd_mean'):.4f} → {get_m(mmd_align,'mmd_mean'):.4f}\n\n"
         "• Conclusion: r ≈ 0.70 arises from multi-domain\n"
         "  pretraining, not from MMD alignment.\n"
