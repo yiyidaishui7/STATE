@@ -435,15 +435,19 @@ class StateEmbeddingModel(L.LightningModule):
         return mmd / len(sigmas)
 
     def _get_alignment_alpha(self):
-        """Warmup schedule: 0 during warmup, linear ramp to 1.0."""
+        """Cosine warmup schedule: 0 during warmup, smooth cosine ramp to 1.0 using global_step."""
         if not hasattr(self, 'trainer') or self.trainer is None:
             return 0.0
-        current_epoch = self.current_epoch
-        if current_epoch < self.alignment_warmup_epochs:
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup_fraction = self.alignment_warmup_epochs / max(self.trainer.max_epochs, 1)
+        ramp_fraction = 5 / max(self.trainer.max_epochs, 1)
+        warmup_steps = int(total_steps * warmup_fraction)
+        ramp_steps = int(total_steps * ramp_fraction)
+        current_step = self.global_step
+        if current_step < warmup_steps:
             return 0.0
-        ramp_epochs = 5  # ramp up over 5 epochs after warmup
-        progress = min((current_epoch - self.alignment_warmup_epochs) / max(ramp_epochs, 1), 1.0)
-        return progress
+        progress = min((current_step - warmup_steps) / max(ramp_steps, 1), 1.0)
+        return 0.5 * (1 - math.cos(math.pi * progress))
 
     def shared_step(self, batch, batch_idx):
         logging.info(f"Step {self.global_step} - Batch {batch_idx}")
