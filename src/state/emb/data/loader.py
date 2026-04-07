@@ -358,6 +358,9 @@ class VCIDatasetSentenceCollator(object):
                 self.dataset_to_protein_embeddings = {"default": identity_map}
 
         self.global_size = utils.get_embedding_cfg(self.cfg).num
+        # 构建大小写不敏感的 key 映射，用于 _resolve_dataset_key()
+        self._ds_key_lower = {k.lower(): k for k in self.dataset_to_protein_embeddings}
+
         self.global_to_local = {}
         for dataset_name, ds_emb_idxs in self.dataset_to_protein_embeddings.items():
             # make sure tensor with long data type
@@ -371,6 +374,18 @@ class VCIDatasetSentenceCollator(object):
             mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
             reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
             self.global_to_local[dataset_name] = reverse_mapping
+
+    def _resolve_dataset_key(self, dataset: str) -> str:
+        """大小写不敏感地查找 dataset 在 mapping 中的真实 key。
+        优先精确匹配，再尝试小写匹配，最后回退到 'default'。"""
+        if dataset in self.dataset_to_protein_embeddings:
+            return dataset
+        canonical = self._ds_key_lower.get(dataset.lower())
+        if canonical is not None:
+            return canonical
+        if "default" in self.dataset_to_protein_embeddings:
+            return "default"
+        raise KeyError(f"Dataset '{dataset}' not found in dataset_to_protein_embeddings")
 
     def __call__(self, batch):
         num_aug = getattr(self.cfg.model, "num_downsample", 1)
@@ -423,10 +438,12 @@ class VCIDatasetSentenceCollator(object):
         max_len = 0
         for counts, idx, dataset, dataset_num in batch:
             if self.valid_gene_mask is not None:
+                # 大小写不敏感查找
                 if dataset in self.valid_gene_mask:
                     valid_mask = self.valid_gene_mask[dataset]
                 else:
-                    valid_mask = None
+                    lower_key = next((k for k in self.valid_gene_mask if k.lower() == dataset.lower()), None)
+                    valid_mask = self.valid_gene_mask[lower_key] if lower_key else None
             else:
                 valid_mask = None
 
@@ -530,12 +547,8 @@ class VCIDatasetSentenceCollator(object):
         original_counts_raw = counts_raw.clone()
 
         # logic to sample a single cell sentence and task sentence here
-        if dataset in self.dataset_to_protein_embeddings:
-            ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings[dataset], dtype=torch.long)
-        elif "default" in self.dataset_to_protein_embeddings:
-            ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings["default"], dtype=torch.long)
-        else:
-            raise KeyError(f"Dataset '{dataset}' not found in dataset_to_protein_embeddings")
+        resolved_key = self._resolve_dataset_key(dataset)
+        ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings[resolved_key], dtype=torch.long)
 
         original_counts = original_counts_raw
         counts = counts_raw
