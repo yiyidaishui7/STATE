@@ -139,6 +139,11 @@ def load_state_model(checkpoint_path, cfg):
     all_pe.requires_grad_(False)
     model.pe_embedding = nn.Embedding.from_pretrained(all_pe)
     model.pe_embedding = model.pe_embedding.to(device)
+
+    # 将 protein_embeds_dict 挂到 model.protein_embeds，使 get_gene_embedding() 可按基因名查询
+    if "protein_embeds_dict" in ckpt:
+        model.protein_embeds = ckpt["protein_embeds_dict"]
+
     model.eval()
     return model, device
 
@@ -179,13 +184,13 @@ def encode_cells_to_cls(model, cfg, h5_path, cell_indices, args, device):
     collator = VCIDatasetSentenceCollator(cfg, is_train=False)
     collator.cfg = cfg
 
+    # num_workers=0 避免在循环中多次创建 worker 进程导致文件描述符泄漏 (Errno 9)
     loader = DataLoader(
         subset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collator,
-        num_workers=args.num_workers,
-        persistent_workers=(args.num_workers > 0),
+        num_workers=0,
     )
 
     all_cls = []
@@ -199,7 +204,7 @@ def encode_cells_to_cls(model, cfg, h5_path, cell_indices, args, device):
 
 def predict_from_emb(model, cell_emb, gene_embs, read_depth, device):
     """
-    给定单个 CLS embedding (1, 512) 和所有基因 embedding，
+    给定单个 CLS embedding (output_dim,) 和所有基因 embedding (n_genes, d_model)，
     返回全基因预测分数 np.ndarray (n_genes,)。
     分批计算避免 OOM。
     """
@@ -207,13 +212,17 @@ def predict_from_emb(model, cell_emb, gene_embs, read_depth, device):
     n_genes = gene_embs.size(0)
     all_scores = []
 
+    # 兼容 (output_dim,) 和 (1, output_dim) 两种输入形状
+    cell_emb = cell_emb.reshape(-1)              # 统一为 (output_dim,)
+    z_base = cell_emb.unsqueeze(0).unsqueeze(0)  # (1, 1, output_dim)
+
     for start in range(0, n_genes, batch_size):
         end = min(start + batch_size, n_genes)
         gene_batch = gene_embs[start:end].to(device)
         n_batch = gene_batch.size(0)
 
-        z = cell_emb.expand(1, -1).unsqueeze(1).repeat(1, n_batch, 1)  # (1, n_batch, 512)
-        g = gene_batch.unsqueeze(0)                                      # (1, n_batch, d_model)
+        z = z_base.expand(1, n_batch, -1)   # (1, n_batch, output_dim)
+        g = gene_batch.unsqueeze(0)          # (1, n_batch, d_model)
 
         if model.z_dim_rd == 1:
             rd = torch.full((1, n_batch, 1), read_depth, device=device)
@@ -222,10 +231,60 @@ def predict_from_emb(model, cell_emb, gene_embs, read_depth, device):
             combine = torch.cat([g, z], dim=2)
 
         with torch.no_grad():
-            scores = model.binary_decoder(combine).squeeze()
+            # squeeze(-1) 避免 n_batch==1 时把整个 tensor 压成标量
+            scores = model.binary_decoder(combine).squeeze(-1).squeeze(0)
             all_scores.append(scores.cpu().float().numpy())
 
     return np.concatenate(all_scores)  # (n_genes,)
+
+
+def _build_gene_embs(model, h5_path, device):
+    """
+    构建全基因的 d_model 维 embedding。
+    假设 h5 文件中第 i 列基因对应 pe_embedding 第 i 行
+    （与训练时 H5adSentenceDataset 的列顺序一致）。
+    """
+    import h5py
+    with h5py.File(h5_path, "r") as f:
+        attrs = dict(f["X"].attrs)
+        if "shape" in attrs:
+            n_genes = int(attrs["shape"][1])
+        elif hasattr(f["X"], "shape") and len(f["X"].shape) == 2:
+            n_genes = f["X"].shape[1]
+        else:
+            n_genes = int(attrs.get("shape", [0, 18080])[1])
+
+    with torch.no_grad():
+        gene_indices = torch.arange(n_genes, device=device)
+        raw_embs = model.pe_embedding(gene_indices)       # (n_genes, token_dim)
+        gene_embs = model.gene_embedding_layer(raw_embs)  # (n_genes, d_model)
+    return gene_embs
+
+
+def get_predictions_for_cells(model, cfg, h5_path, cell_indices, args, device,
+                               gene_embs=None):
+    """
+    对指定细胞编码并解码到全基因预测空间。
+    返回 np.ndarray (n_cells, n_genes)。
+
+    gene_embs: 可选，预先计算好的基因 embedding (n_genes, d_model)。
+               跨扰动复用时传入以避免重复计算。
+    """
+    # Step 1: CLS embeddings (n_cells, output_dim)
+    cls_embs = encode_cells_to_cls(model, cfg, h5_path, cell_indices, args, device)
+
+    # Step 2: 获取基因 embedding（若未传入则现算）
+    if gene_embs is None:
+        gene_embs = _build_gene_embs(model, h5_path, device)
+
+    # Step 3: 对每个细胞解码全基因
+    all_preds = []
+    for i in range(len(cls_embs)):
+        cell_tensor = torch.tensor(cls_embs[i], dtype=torch.float32, device=device)
+        pred = predict_from_emb(model, cell_tensor, gene_embs, args.read_depth, device)
+        all_preds.append(pred)
+
+    return np.stack(all_preds, axis=0)  # (n_cells, n_genes)
 
 
 # ============================================================================
