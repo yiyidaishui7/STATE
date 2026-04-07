@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 BASE_DIR = "/media/mldadmin/home/s125mdg34_03/state"
 DEFAULT_H5AD = f"{BASE_DIR}/competition_support_set/hepg2.h5"
+FIGURES_DIR = f"{BASE_DIR}/figures"
 
 
 def parse_args():
@@ -542,7 +543,10 @@ def main():
 
     output_dir = args.output
     if output_dir is None:
-        output_dir = str(Path(args.checkpoint).parent / "eval_deg_pearson")
+        # 默认保存到 state/figures/deg_pearson/<数据集名>/
+        # 不同数据集（hepg2/jurkat/k562/rpe1）自动分文件夹
+        dataset_name = Path(args.h5ad).stem  # e.g. "hepg2"
+        output_dir = str(Path(FIGURES_DIR) / "deg_pearson" / dataset_name)
     os.makedirs(output_dir, exist_ok=True)
     print(f"\n输出目录: {output_dir}")
     print(f"数据文件: {args.h5ad}")
