@@ -144,15 +144,16 @@ def load_state_model(checkpoint_path, cfg):
 
 
 # ============================================================================
-# 模型推理：对一批细胞获取预测表达值
+# 模型推理：encode 细胞 → CLS embedding，再 decode 全部基因
 # ============================================================================
 
-def get_predictions_for_cells(model, cfg, h5_path, cell_indices, args, device):
+def encode_cells_to_cls(model, cfg, h5_path, cell_indices, args, device):
     """
-    对指定细胞索引获取模型预测的基因表达分数。
-    返回 np.ndarray of shape (n_cells, n_genes)。
+    对指定细胞编码，返回 CLS embedding np.ndarray (n_cells, 512)。
+    不受每 batch 采样基因数限制。
     """
     from state.emb.data import H5adSentenceDataset, VCIDatasetSentenceCollator
+    from torch.utils.data import Subset
     import h5py
 
     domain_name = Path(h5_path).stem
@@ -174,10 +175,7 @@ def get_predictions_for_cells(model, cfg, h5_path, cell_indices, args, device):
     )
     dataset.dataset_path_map = {domain_name: h5_path}
 
-    # 用 Subset 选取指定细胞
-    from torch.utils.data import Subset
     subset = Subset(dataset, cell_indices)
-
     collator = VCIDatasetSentenceCollator(cfg, is_train=False)
     collator.cfg = cfg
 
@@ -190,28 +188,44 @@ def get_predictions_for_cells(model, cfg, h5_path, cell_indices, args, device):
         persistent_workers=(args.num_workers > 0),
     )
 
-    all_decs = []
+    all_cls = []
     with torch.no_grad():
         for batch in loader:
-            X, Y, _, embs, _ = model._compute_embedding_for_batch(batch)
-            z = embs.unsqueeze(1).repeat(1, X.shape[1], 1)
+            _, _, _, embs, _ = model._compute_embedding_for_batch(batch)
+            all_cls.append(embs.detach().cpu().float().numpy())
 
-            if model.z_dim_rd == 1:
-                Y_float = Y.float().to(X.device)
-                mu = torch.nan_to_num(
-                    torch.nanmean(
-                        Y_float.masked_fill(Y_float == 0, float("nan")), dim=1
-                    ), nan=0.0
-                )
-                reshaped_counts = mu.unsqueeze(1).unsqueeze(2).repeat(1, X.shape[1], 1)
-                combine = torch.cat((X, z, reshaped_counts), dim=2)
-            else:
-                combine = torch.cat((X, z), dim=2)
+    return np.concatenate(all_cls, axis=0)  # (n_cells, 512)
 
-            decs = model.binary_decoder(combine).squeeze(-1)  # (B, n_genes)
-            all_decs.append(decs.detach().cpu().float().numpy())
 
-    return np.concatenate(all_decs, axis=0)  # (n_cells, n_genes)
+def predict_from_emb(model, cell_emb, gene_embs, read_depth, device):
+    """
+    给定单个 CLS embedding (1, 512) 和所有基因 embedding，
+    返回全基因预测分数 np.ndarray (n_genes,)。
+    分批计算避免 OOM。
+    """
+    batch_size = 512
+    n_genes = gene_embs.size(0)
+    all_scores = []
+
+    for start in range(0, n_genes, batch_size):
+        end = min(start + batch_size, n_genes)
+        gene_batch = gene_embs[start:end].to(device)
+        n_batch = gene_batch.size(0)
+
+        z = cell_emb.expand(1, -1).unsqueeze(1).repeat(1, n_batch, 1)  # (1, n_batch, 512)
+        g = gene_batch.unsqueeze(0)                                      # (1, n_batch, d_model)
+
+        if model.z_dim_rd == 1:
+            rd = torch.full((1, n_batch, 1), read_depth, device=device)
+            combine = torch.cat([g, z, rd], dim=2)
+        else:
+            combine = torch.cat([g, z], dim=2)
+
+        with torch.no_grad():
+            scores = model.binary_decoder(combine).squeeze()
+            all_scores.append(scores.cpu().float().numpy())
+
+    return np.concatenate(all_scores)  # (n_genes,)
 
 
 # ============================================================================
@@ -223,6 +237,9 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
     对每个扰动：
       1. 找出 DE 基因（Wilcoxon test，adj p < pval_cutoff）
       2. 在 DE 基因上计算 Pearson r（预测 vs 实际）
+
+    推理方式：encode 细胞 → 平均 CLS embedding → decode 全部基因
+    避免 H5adSentenceDataset 每 batch 只采样部分基因导致的索引越界。
     """
     import scanpy as sc
     import anndata as ad
@@ -250,6 +267,24 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
     if len(ctrl_indices) > args.max_cells_per_group:
         ctrl_indices = ctrl_indices[:args.max_cells_per_group]
 
+    # ---- 预计算全基因 embedding（循环外，只算一次）----
+    gene_names = list(adata.var_names)
+    n_total_genes = len(gene_names)
+    print(f"  获取全基因 embedding ({n_total_genes} genes)...")
+    with torch.no_grad():
+        gene_embs = model.get_gene_embedding(gene_names).detach().cpu()  # (n_genes, d_model)
+
+    # ---- 预计算 ctrl CLS embedding 均值（循环外，只算一次）----
+    print(f"  编码对照组细胞 ({len(ctrl_indices)} cells)...")
+    ctrl_cls = encode_cells_to_cls(model, cfg, h5_path, list(ctrl_indices), args, device)
+    ctrl_cls_mean = torch.tensor(ctrl_cls.mean(axis=0), dtype=torch.float32).unsqueeze(0).to(device)  # (1, 512)
+
+    # ctrl 全基因预测（循环外）
+    pred_ctrl_all = predict_from_emb(model, ctrl_cls_mean, gene_embs, args.read_depth, device)
+    # pred_ctrl_all: (n_total_genes,)
+
+    actual_ctrl_mean_all = adata.X[ctrl_indices].mean(axis=0)  # (n_total_genes,)
+
     pearson_list = []
     results_per_pert = []
     n_skipped = 0
@@ -262,7 +297,6 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
             n_skipped += 1
             continue
 
-        # 取样加速
         if len(pert_indices) > args.max_cells_per_group:
             pert_indices = pert_indices[:args.max_cells_per_group]
 
@@ -289,7 +323,7 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
                 group="perturbed",
                 pval_cutoff=args.pval_cutoff,
             )
-        except Exception as e:
+        except Exception:
             n_skipped += 1
             continue
 
@@ -297,38 +331,33 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
             n_skipped += 1
             continue
 
-        # DE 基因名 → 基因索引
+        # DE 基因名 → 索引（在 adata 全基因中的位置）
         de_gene_names = set(de_df["names"].tolist())
-        gene_names = list(adata.var_names)
-        de_gene_indices = [i for i, g in enumerate(gene_names) if g in de_gene_names]
+        de_gene_indices = np.array([i for i, g in enumerate(gene_names) if g in de_gene_names])
 
         if len(de_gene_indices) < args.min_de_genes:
             n_skipped += 1
             continue
 
-        # ---- Step 2: 获取模型预测 ----
-        all_indices = list(ctrl_indices) + list(pert_indices)
+        # ---- Step 2: 编码扰动组细胞 → 平均 CLS → decode 全基因 ----
         try:
-            pred_all = get_predictions_for_cells(model, cfg, h5_path, all_indices, args, device)
+            pert_cls = encode_cells_to_cls(model, cfg, h5_path, list(pert_indices), args, device)
         except Exception as e:
-            print(f"  推理失败 ({pert}): {e}")
+            print(f"  编码失败 ({pert}): {e}")
             n_skipped += 1
             continue
 
-        n_ctrl_used = len(ctrl_indices)
-        pred_ctrl = pred_all[:n_ctrl_used]    # (n_ctrl, n_genes)
-        pred_pert = pred_all[n_ctrl_used:]    # (n_pert, n_genes)
+        pert_cls_mean = torch.tensor(pert_cls.mean(axis=0), dtype=torch.float32).unsqueeze(0).to(device)
+        pred_pert_all = predict_from_emb(model, pert_cls_mean, gene_embs, args.read_depth, device)
+        # pred_pert_all: (n_total_genes,)
 
         # ---- Step 3: 在 DE 基因上计算 Pearson r ----
-        # actual: 扰动平均 vs 对照平均（在 DE 基因上）
-        actual_ctrl_mean = adata.X[ctrl_indices][:, de_gene_indices].mean(axis=0)
+        actual_ctrl_mean = actual_ctrl_mean_all[de_gene_indices]
         actual_pert_mean = adata.X[pert_indices][:, de_gene_indices].mean(axis=0)
         actual_logfc = actual_pert_mean - actual_ctrl_mean  # (n_de_genes,)
 
-        # predicted log-FC on DE genes
-        pred_ctrl_mean = pred_ctrl[:, de_gene_indices].mean(axis=0)
-        pred_pert_mean = pred_pert[:, de_gene_indices].mean(axis=0)
-        pred_logfc = pred_pert_mean - pred_ctrl_mean  # (n_de_genes,)
+        # predicted log-FC on DE genes（用全基因预测结果取 DE 子集）
+        pred_logfc = pred_pert_all[de_gene_indices] - pred_ctrl_all[de_gene_indices]
 
         valid = ~(np.isnan(actual_logfc) | np.isnan(pred_logfc))
         if valid.sum() < args.min_de_genes:
