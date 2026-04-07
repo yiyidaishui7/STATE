@@ -663,7 +663,7 @@ class VCIDatasetSentenceCollator(object):
                 # task_sentence[c, unshared_num:] = ds_emb_idxs[shared_genes.to(torch.int32)] # in the new impl these are local gene indices
 
                 # convert the shared_genes, which are global indices, to the dataset specific indices
-                g2l_key = dataset if dataset in self.global_to_local else "default"
+                g2l_key = resolved_key  # 复用已大小写不敏感解析过的 key
                 local_indices = self.global_to_local[g2l_key][shared_genes].to(
                     cell.device
                 )  # in the old impl these are global gene indices
