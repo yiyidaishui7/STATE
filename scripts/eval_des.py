@@ -430,7 +430,8 @@ def plot_comparison(results_list, output_dir, k):
     bars = ax.bar(names, means, yerr=stds, color=colors,
                   capsize=6, alpha=0.85, edgecolor="white", linewidth=0.5)
     # 随机基线：随机选 k 个基因，期望 overlap = k² / n_genes ≈ 0
-    random_baseline = k / len(valid[0].get("per_perturbation", [{}])[0].get("n_de_genes", 18000) or 18000)
+    n_genes_est = 18000
+    random_baseline = k / n_genes_est
     ax.axhline(random_baseline, color="gray", linestyle="--", linewidth=1,
                label=f"Random baseline (~{random_baseline:.4f})", alpha=0.7)
     ax.set_ylabel(f"DES (top-{k} gene overlap)", fontsize=12)
