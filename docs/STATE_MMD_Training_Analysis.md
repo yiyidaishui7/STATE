@@ -642,10 +642,11 @@ STATE 的损失函数 TabularLoss（energy distance）优化的是**预测分布
   ✓ LOO 实验（四细胞系）
     → 全部 DEG Pearson ≈ 0，排除域泛化问题，确认架构问题
   ✓ 诊断：TabularLoss 无法驱动扰动方向预测
+  ✓ eval_des.py（STATE 原生 DES，top-k gene overlap）
+    → STATE+MMD=0.0054, Baseline=0.0042，均紧贴随机基线(0.0028)
+    → 与 DEG Pearson 结论一致：binary_decoder 对真实 DEG 无区分能力
 
 待完成：
-  → eval_des.py（STATE 原生 DES 指标）
-    → 运行命令见下方"第八部分"
   → 选择新的损失函数方向（见7.4节建议）
   → 实现 rank correlation / weighted DEG loss
   → 在 hepg2 零样本场景重新验证，目标 DEG Pearson > 0.10
@@ -734,12 +735,21 @@ done
 - `des_distribution.png` — 每扰动 DES 分布直方图
 - `des_results_<ts>.json` — 完整结果（含每个扰动）
 
-### 8.3 预期结果与参考区间
+### 8.3 实测结果（2026-04-12，HepG2 零样本）
 
-| 模型           | 预期 DES (top-50) | 参考               |
-| -------------- | ----------------- | -------------------|
-| Random         | ~0.003            | k²/n_genes         |
-| STATE Baseline | TBD               | 运行后填入          |
-| STATE+MMD      | TBD               | 运行后填入          |
+**数据：** `competition_support_set/hepg2.h5`，52 个有效扰动（16 个因 DEG < 3 跳过）
 
-若 DES ≈ DEG Pearson 的结论一致（≈ 0），说明 binary_decoder 无法识别真实 DEG，与架构诊断相符。若 DES > 0.05，则说明模型有一定基因命中能力，值得进一步分析。
+| 模型           | mean DES (top-50) | median | std    | DES>0 比例 |
+| -------------- | ----------------- | ------ | ------ | ---------- |
+| Random         | ~0.0028           | —      | —      | —          |
+| STATE Baseline | 0.0042            | 0.0000 | 0.0091 | 19.2%      |
+| STATE+MMD      | **0.0054**        | 0.0000 | 0.0112 | 21.2%      |
+
+**结果文件：** `~/state/figures/des/hepg2/des_summary_20260412_185649.csv`
+
+### 8.4 结论
+
+- **两个模型均紧贴随机基线**（0.0028），DES 没有统计意义上的提升
+- **median = 0**：超过一半的扰动完全没命中任何真实 DEG
+- **MMD 对齐有微弱正向效果**：STATE+MMD (0.0054) 略高于 Baseline (0.0042)，但差距在 std 范围内（不显著）
+- **与 DEG Pearson 结论一致**：两个指标从不同角度（方向相关 vs 基因命中率）均指向同一诊断——`binary_decoder` 产生的预测分数对真实 DEG 无区分能力，TabularLoss 优化的是分布相似性而非扰动方向
