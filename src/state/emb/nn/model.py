@@ -211,20 +211,18 @@ class StateEmbeddingModel(L.LightningModule):
         # ================================================================
         self.logfc_weight = getattr(self.cfg.model, "logfc_weight", 0.0)
         ctrl_stats_path   = getattr(self.cfg.model, "ctrl_stats_path", None)
+        # 普通属性（不进 state_dict），避免从旧 checkpoint 恢复时报 missing key
+        self.ctrl_mean_by_pe_idx = None
+        self.ctrl_cls_ref        = None
         if ctrl_stats_path and self.logfc_weight > 0:
             import os
             if os.path.exists(ctrl_stats_path):
                 stats = torch.load(ctrl_stats_path, map_location="cpu", weights_only=False)
-                self.register_buffer("ctrl_mean_by_pe_idx", stats["ctrl_mean_by_pe_idx"])  # (global_size,)
-                self.register_buffer("ctrl_cls_ref",        stats["ctrl_cls_ref"])          # (output_dim,)
+                self.ctrl_mean_by_pe_idx = stats["ctrl_mean_by_pe_idx"]  # (global_size,) CPU tensor
+                self.ctrl_cls_ref        = stats["ctrl_cls_ref"]          # (output_dim,)  CPU tensor
                 print(f"  [LogFC Loss] ctrl stats 已加载: {ctrl_stats_path}，weight={self.logfc_weight}")
             else:
                 print(f"  [LogFC Loss] ⚠ 文件不存在: {ctrl_stats_path}，logFC loss 将被跳过")
-                self.ctrl_mean_by_pe_idx = None
-                self.ctrl_cls_ref        = None
-        else:
-            self.ctrl_mean_by_pe_idx = None
-            self.ctrl_cls_ref        = None
 
     def on_save_checkpoint(self, checkpoint):
         """
@@ -558,12 +556,14 @@ class StateEmbeddingModel(L.LightningModule):
             pred_raw    = decs.squeeze(-1)                   # (B, n_task_genes)
 
             # 真实 logFC = Y - ctrl_mean（在 pe_embedding 全局索引空间对齐）
-            ctrl_true = self.ctrl_mean_by_pe_idx[task_pe_idx]          # (B, n_task_genes)
+            # .to(self.device)：tensor 是 CPU 加载的，需要移到训练设备
+            ctrl_mean_dev = self.ctrl_mean_by_pe_idx.to(self.device)
+            ctrl_true  = ctrl_mean_dev[task_pe_idx]                    # (B, n_task_genes)
             true_logfc = Y.float().to(self.device) - ctrl_true         # (B, n_task_genes)
 
             # 预测 logFC = binary_decoder(ctrl_cls_ref, task_gene_embs) 的输出
             # X 已是 (B, n_task_genes, d_model)，ctrl_cls_ref 是 (output_dim,)
-            ctrl_z = self.ctrl_cls_ref.view(1, 1, -1).expand(1, X.shape[1], -1)  # (1, T, output_dim)
+            ctrl_z = self.ctrl_cls_ref.to(self.device).view(1, 1, -1).expand(1, X.shape[1], -1)  # (1, T, output_dim)
             if self.z_dim_rd == 1:
                 # mu 在上面的 if-else 块中已经计算好了
                 ctrl_mu = mu.mean().detach().view(1, 1, 1).expand(1, X.shape[1], 1)
