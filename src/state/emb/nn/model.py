@@ -206,6 +206,26 @@ class StateEmbeddingModel(L.LightningModule):
             self.alignment_warmup_epochs = getattr(self.cfg.model, "alignment_warmup", 5)
             self.domain_adv_loss = nn.CrossEntropyLoss()
 
+        # ================================================================
+        # LogFC Loss（路线一：方向感知扰动损失）
+        # ================================================================
+        self.logfc_weight = getattr(self.cfg.model, "logfc_weight", 0.0)
+        ctrl_stats_path   = getattr(self.cfg.model, "ctrl_stats_path", None)
+        if ctrl_stats_path and self.logfc_weight > 0:
+            import os
+            if os.path.exists(ctrl_stats_path):
+                stats = torch.load(ctrl_stats_path, map_location="cpu", weights_only=False)
+                self.register_buffer("ctrl_mean_by_pe_idx", stats["ctrl_mean_by_pe_idx"])  # (global_size,)
+                self.register_buffer("ctrl_cls_ref",        stats["ctrl_cls_ref"])          # (output_dim,)
+                print(f"  [LogFC Loss] ctrl stats 已加载: {ctrl_stats_path}，weight={self.logfc_weight}")
+            else:
+                print(f"  [LogFC Loss] ⚠ 文件不存在: {ctrl_stats_path}，logFC loss 将被跳过")
+                self.ctrl_mean_by_pe_idx = None
+                self.ctrl_cls_ref        = None
+        else:
+            self.ctrl_mean_by_pe_idx = None
+            self.ctrl_cls_ref        = None
+
     def on_save_checkpoint(self, checkpoint):
         """
         Persist a snapshot of the training config inside the checkpoint so downstream
@@ -527,6 +547,39 @@ class StateEmbeddingModel(L.LightningModule):
                 loss = loss + dataset_loss
             else:
                 self.log("validation/dataset_loss", dataset_loss)
+
+        # ================================================================
+        # LogFC Loss：鼓励模型预测正确的扰动方向
+        # 只在训练时生效；需要提前运行 compute_ctrl_stats.py
+        # ================================================================
+        if self.training and self.logfc_weight > 0 and self.ctrl_mean_by_pe_idx is not None:
+            # batch[1]: (B, n_task_genes) — global pe_embedding 索引
+            task_pe_idx = batch[1].to(self.device).long()   # (B, n_task_genes)
+            pred_raw    = decs.squeeze(-1)                   # (B, n_task_genes)
+
+            # 真实 logFC = Y - ctrl_mean（在 pe_embedding 全局索引空间对齐）
+            ctrl_true = self.ctrl_mean_by_pe_idx[task_pe_idx]          # (B, n_task_genes)
+            true_logfc = Y.float().to(self.device) - ctrl_true         # (B, n_task_genes)
+
+            # 预测 logFC = binary_decoder(ctrl_cls_ref, task_gene_embs) 的输出
+            # X 已是 (B, n_task_genes, d_model)，ctrl_cls_ref 是 (output_dim,)
+            ctrl_z = self.ctrl_cls_ref.view(1, 1, -1).expand(1, X.shape[1], -1)  # (1, T, output_dim)
+            if self.z_dim_rd == 1:
+                # mu 在上面的 if-else 块中已经计算好了
+                ctrl_mu = mu.mean().detach().view(1, 1, 1).expand(1, X.shape[1], 1)
+                ctrl_combine = torch.cat([X[:1].detach(), ctrl_z, ctrl_mu], dim=2)
+            else:
+                ctrl_combine = torch.cat([X[:1].detach(), ctrl_z], dim=2)
+
+            with torch.no_grad():
+                # (1, n_task_genes, 1) → squeeze → (n_task_genes,)
+                ctrl_pred = self.binary_decoder(ctrl_combine).squeeze(-1).squeeze(0)
+
+            pred_logfc = pred_raw - ctrl_pred.unsqueeze(0)             # (B, n_task_genes)
+
+            logfc_loss = F.mse_loss(pred_logfc, true_logfc)
+            loss = loss + self.logfc_weight * logfc_loss
+            self.log("trainer/logfc_loss", logfc_loss)
 
         # ================================================================
         # Domain alignment loss (MMD + Adversarial) on CLS embeddings

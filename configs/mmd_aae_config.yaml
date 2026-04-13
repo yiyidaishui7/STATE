@@ -82,6 +82,10 @@ model:
   adv_weight: 0.1
   alignment_warmup: 5
   num_domains: 3
+  # 路线一：logFC MSE loss（方向感知扰动损失）
+  # 需要先运行 scripts/compute_ctrl_stats.py 生成 ctrl_stats_k562.pt
+  logfc_weight: 0.1
+  ctrl_stats_path: /media/mldadmin/home/s125mdg34_03/state/ctrl_stats_k562.pt
 
 optimizer:
   max_lr: 1.0e-05
