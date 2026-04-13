@@ -190,6 +190,8 @@ def compute_ctrl_cls_ref(checkpoint_path, cfg, h5_path, ctrl_indices, batch_size
         if "shape" in attrs:
             n_cells_total = int(attrs["shape"][0])
             n_genes       = int(attrs["shape"][1])
+        elif hasattr(f["X"], "shape") and len(f["X"].shape) == 2:
+            n_cells_total, n_genes = f["X"].shape
         else:
             indptr = f["X"]["indptr"]
             n_cells_total = indptr.shape[0] - 1
