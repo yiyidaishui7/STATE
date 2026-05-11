@@ -63,7 +63,10 @@ def parse_args():
     p.add_argument("--h5ad", default=DEFAULT_H5AD, help="h5ad 文件路径（带扰动标签）")
     p.add_argument("--pert_col", default="gene", help="obs 列名（扰动标签）")
     p.add_argument("--ctrl_label", default="non-targeting", help="对照组标签")
-    p.add_argument("--pval_cutoff", type=float, default=0.05, help="adj p-value 阈值")
+    p.add_argument("--pval_cutoff", type=float, default=0.05,
+                   help="adj p-value 阈值（--top_k_max 未设时生效）")
+    p.add_argument("--top_k_max", type=int, default=10,
+                   help="按 |Wilcoxon scores| 依次取 top-1..top_k_max 基因各算一次 PCC（默认 10）")
     p.add_argument("--min_de_genes", type=int, default=5, help="最少 DE 基因数才计算 Pearson r")
     p.add_argument("--max_cells_per_group", type=int, default=200,
                    help="每组最多取多少细胞（加速）")
@@ -294,12 +297,11 @@ def get_predictions_for_cells(model, cfg, h5_path, cell_indices, args, device,
 
 def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
     """
-    对每个扰动：
-      1. 找出 DE 基因（Wilcoxon test，adj p < pval_cutoff）
-      2. 在 DE 基因上计算 Pearson r（预测 vs 实际）
+    对每个扰动，按 |Wilcoxon scores| 降序排列全部基因，
+    依次取 top-1, top-2, ..., top_k_max 个基因各算一次 Pearson r，
+    输出 PCC 随基因数 k 变化的曲线。
 
-    推理方式：encode 细胞 → 平均 CLS embedding → decode 全部基因
-    避免 H5adSentenceDataset 每 batch 只采样部分基因导致的索引越界。
+    推理：encode 细胞 → 平均 CLS embedding → decode 全部基因（循环外只算一次）
     """
     import scanpy as sc
     import anndata as ad
@@ -330,6 +332,7 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
     # ---- 预计算全基因 embedding（循环外，只算一次）----
     gene_names = list(adata.var_names)
     n_total_genes = len(gene_names)
+    gene_name_to_idx = {g: i for i, g in enumerate(gene_names)}
     print(f"  获取全基因 embedding ({n_total_genes} genes)...")
     with torch.no_grad():
         gene_embs = model.get_gene_embedding(gene_names).detach().cpu()  # (n_genes, d_model)
@@ -337,19 +340,20 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
     # ---- 预计算 ctrl CLS embedding 均值（循环外，只算一次）----
     print(f"  编码对照组细胞 ({len(ctrl_indices)} cells)...")
     ctrl_cls = encode_cells_to_cls(model, cfg, h5_path, list(ctrl_indices), args, device)
-    ctrl_cls_mean = torch.tensor(ctrl_cls.mean(axis=0), dtype=torch.float32).unsqueeze(0).to(device)  # (1, 512)
+    ctrl_cls_mean = torch.tensor(ctrl_cls.mean(axis=0), dtype=torch.float32).unsqueeze(0).to(device)
 
     # ctrl 全基因预测（循环外）
     pred_ctrl_all = predict_from_emb(model, ctrl_cls_mean, gene_embs, args.read_depth, device)
     # pred_ctrl_all: (n_total_genes,)
 
-    actual_ctrl_mean_all = adata.X[ctrl_indices].mean(axis=0)  # (n_total_genes,)
+    actual_ctrl_mean_all = np.asarray(adata.X[ctrl_indices].mean(axis=0)).ravel()  # (n_total_genes,)
 
-    pearson_list = []
+    k_values = list(range(1, args.top_k_max + 1))
+    pearson_at_k = {k: [] for k in k_values}   # PCC 列表，按 k 分组
     results_per_pert = []
     n_skipped = 0
 
-    for pert in tqdm(pert_unique, desc=f"  [{label}] DEG Pearson"):
+    for pert in tqdm(pert_unique, desc=f"  [{label}] DEG Pearson curve"):
         pert_mask = pert_labels == pert
         pert_indices = np.where(pert_mask)[0]
 
@@ -360,7 +364,7 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
         if len(pert_indices) > args.max_cells_per_group:
             pert_indices = pert_indices[:args.max_cells_per_group]
 
-        # ---- Step 1: 找 DE 基因（Wilcoxon, 用真实数据） ----
+        # ---- Step 1: Wilcoxon，取全部基因按 |scores| 排序 ----
         adata_ctrl = adata[ctrl_indices].copy()
         adata_pert = adata[pert_indices].copy()
         adata_ctrl.obs["_group"] = "control"
@@ -378,28 +382,18 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
                 tie_correct=True,
                 use_raw=False,
             )
-            de_df = sc.get.rank_genes_groups_df(
-                adata_combined,
-                group="perturbed",
-                pval_cutoff=args.pval_cutoff,
-            )
+            de_df = sc.get.rank_genes_groups_df(adata_combined, group="perturbed")
+            de_df = de_df.copy()
+            de_df["abs_scores"] = de_df["scores"].abs()
+            de_df = de_df.sort_values("abs_scores", ascending=False).reset_index(drop=True)
         except Exception:
             n_skipped += 1
             continue
 
-        if len(de_df) < args.min_de_genes:
-            n_skipped += 1
-            continue
+        # 取前 top_k_max 个基因名（后续按 k 截取）
+        ranked_genes = de_df["names"].iloc[: args.top_k_max].tolist()
 
-        # DE 基因名 → 索引（在 adata 全基因中的位置）
-        de_gene_names = set(de_df["names"].tolist())
-        de_gene_indices = np.array([i for i, g in enumerate(gene_names) if g in de_gene_names])
-
-        if len(de_gene_indices) < args.min_de_genes:
-            n_skipped += 1
-            continue
-
-        # ---- Step 2: 编码扰动组细胞 → 平均 CLS → decode 全基因 ----
+        # ---- Step 2: 编码扰动组 → 预测全基因 ----
         try:
             pert_cls = encode_cells_to_cls(model, cfg, h5_path, list(pert_indices), args, device)
         except Exception as e:
@@ -409,59 +403,62 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
 
         pert_cls_mean = torch.tensor(pert_cls.mean(axis=0), dtype=torch.float32).unsqueeze(0).to(device)
         pred_pert_all = predict_from_emb(model, pert_cls_mean, gene_embs, args.read_depth, device)
-        # pred_pert_all: (n_total_genes,)
 
-        # ---- Step 3: 在 DE 基因上计算 Pearson r ----
-        actual_ctrl_mean = actual_ctrl_mean_all[de_gene_indices]
-        actual_pert_mean = adata.X[pert_indices][:, de_gene_indices].mean(axis=0)
-        actual_logfc = actual_pert_mean - actual_ctrl_mean  # (n_de_genes,)
+        # 全基因 logFC（真实 & 预测）
+        actual_pert_mean_all = np.asarray(adata.X[pert_indices].mean(axis=0)).ravel()
+        actual_logfc_all = actual_pert_mean_all - actual_ctrl_mean_all   # (n_total_genes,)
+        pred_logfc_all   = pred_pert_all - pred_ctrl_all                  # (n_total_genes,)
 
-        # predicted log-FC on DE genes（用全基因预测结果取 DE 子集）
-        pred_logfc = pred_pert_all[de_gene_indices] - pred_ctrl_all[de_gene_indices]
+        # ---- Step 3: 对 k=1..top_k_max 各算一次 Pearson r ----
+        pert_row = {"perturbation": pert, "n_pert_cells": len(pert_indices), "pearson_at_k": {}}
+        for k in k_values:
+            names_k = ranked_genes[:k]
+            idx_k = np.array([gene_name_to_idx[g] for g in names_k if g in gene_name_to_idx])
 
-        valid = ~(np.isnan(actual_logfc) | np.isnan(pred_logfc))
-        if valid.sum() < args.min_de_genes:
-            n_skipped += 1
-            continue
+            if len(idx_k) < 2:
+                # k=1 时只有 1 个点，Pearson r 无意义
+                val = float("nan")
+            else:
+                a = actual_logfc_all[idx_k]
+                p = pred_logfc_all[idx_k]
+                valid = ~(np.isnan(a) | np.isnan(p))
+                if valid.sum() < 2:
+                    val = float("nan")
+                else:
+                    try:
+                        r, _ = pearsonr(p[valid], a[valid])
+                        val = float(r) if not np.isnan(r) else float("nan")
+                    except Exception:
+                        val = float("nan")
 
-        try:
-            r, pval = pearsonr(pred_logfc[valid], actual_logfc[valid])
-        except Exception:
-            n_skipped += 1
-            continue
+            pearson_at_k[k].append(val)
+            pert_row["pearson_at_k"][k] = val
 
-        if np.isnan(r):
-            n_skipped += 1
-            continue
+        results_per_pert.append(pert_row)
 
-        pearson_list.append(float(r))
-        results_per_pert.append({
-            "perturbation": pert,
-            "n_de_genes": len(de_gene_indices),
-            "n_pert_cells": len(pert_indices),
-            "pearson_r": float(r),
-            "pval": float(pval),
-        })
+    n_valid = len(results_per_pert) - n_skipped
+    print(f"\n  完成 {len(results_per_pert)} 个扰动（跳过 {n_skipped} 个）")
 
-    print(f"\n  完成 {len(pearson_list)} 个扰动（跳过 {n_skipped} 个）")
-
-    if not pearson_list:
+    if not results_per_pert:
         return {"label": label, "error": "no valid perturbations"}
 
-    mean_r = float(np.mean(pearson_list))
-    median_r = float(np.median(pearson_list))
-    std_r = float(np.std(pearson_list))
-
-    print(f"  DEG Pearson r: mean={mean_r:.4f}, median={median_r:.4f}, std={std_r:.4f}")
-    print(f"  正相关扰动比例: {sum(r > 0 for r in pearson_list) / len(pearson_list):.1%}")
+    # ---- 汇总：每个 k 的 mean/median/std（忽略 NaN）----
+    pearson_curve = {}
+    print(f"\n  {'k':>4}  {'mean PCC':>10}  {'median PCC':>12}  {'std':>8}  {'N valid':>8}")
+    print(f"  {'-'*50}")
+    for k in k_values:
+        vals = [v for v in pearson_at_k[k] if not np.isnan(v)]
+        if vals:
+            m, med, s = float(np.mean(vals)), float(np.median(vals)), float(np.std(vals))
+        else:
+            m = med = s = float("nan")
+        pearson_curve[k] = {"mean": m, "median": med, "std": s, "n_valid": len(vals)}
+        print(f"  {k:>4}  {m:>10.4f}  {med:>12.4f}  {s:>8.4f}  {len(vals):>8}")
 
     return {
         "label": label,
-        "n_perturbations": len(pearson_list),
-        "pearson_mean": mean_r,
-        "pearson_median": median_r,
-        "pearson_std": std_r,
-        "frac_positive": float(sum(r > 0 for r in pearson_list) / len(pearson_list)),
+        "n_perturbations": len(results_per_pert),
+        "pearson_curve": pearson_curve,
         "per_perturbation": results_per_pert,
     }
 
@@ -470,65 +467,141 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
 # 绘图
 # ============================================================================
 
-def plot_comparison(results_dict, output_dir):
+def plot_pcc_curve(results_list, output_dir):
+    """双子图：上=mean PCC 折线 + std 阴影，下=正相关比例折线。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    names = [r["label"] for r in results_dict if "pearson_mean" in r]
-    means = [r["pearson_mean"] for r in results_dict if "pearson_mean" in r]
-    stds = [r["pearson_std"] for r in results_dict if "pearson_mean" in r]
-
-    if len(names) == 0:
+    valid = [r for r in results_list if "pearson_curve" in r]
+    if not valid:
         return
 
-    colors = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12"][:len(names)]
-    fig, ax = plt.subplots(figsize=(max(6, len(names) * 2.5), 5))
-    bars = ax.bar(names, means, yerr=stds, color=colors,
-                  capsize=6, alpha=0.85, edgecolor="white", linewidth=0.5)
-    ax.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
-    ax.set_ylabel("DEG Pearson r (mean ± std)", fontsize=12)
-    ax.set_title("HepG2 Zero-Shot DEG Pearson r\n(Wilcoxon adj p < 0.05 genes only)", fontsize=12)
-    ax.grid(True, alpha=0.3, axis="y")
-    for bar, v in zip(bars, means):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.005 + (0.01 if v >= 0 else -0.03),
-                f"{v:.4f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    colors = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12"]
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+
+    for r, color in zip(valid, colors):
+        curve = r["pearson_curve"]
+        ks = sorted(curve.keys())
+        means  = np.array([curve[k]["mean"] for k in ks], dtype=float)
+        stds   = np.array([curve[k]["std"]  for k in ks], dtype=float)
+
+        # 上图：mean PCC + std 阴影
+        ax1.plot(ks, means, marker="o", color=color, label=r["label"], linewidth=2, markersize=5)
+        ax1.fill_between(ks, means - stds, means + stds, color=color, alpha=0.15)
+
+        # 下图：每个 k 下 PCC > 0 的扰动比例
+        frac_pos = []
+        for k in ks:
+            vals = [x["pearson_at_k"].get(k, float("nan"))
+                    for x in r.get("per_perturbation", [])
+                    if not np.isnan(x["pearson_at_k"].get(k, float("nan")))]
+            frac_pos.append(np.mean(np.array(vals) > 0) if vals else float("nan"))
+        ax2.plot(ks, frac_pos, marker="s", color=color, label=r["label"], linewidth=2, markersize=5)
+
+    ax1.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax1.set_ylabel("Mean Pearson r", fontsize=12)
+    ax1.set_title("DEG Pearson r vs. Number of Top Genes (ranked by |Wilcoxon scores|)", fontsize=12)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.axhline(0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.6, label="random (50%)")
+    ax2.set_xlabel("Top-k genes", fontsize=12)
+    ax2.set_ylabel("Fraction PCC > 0", fontsize=12)
+    ax2.set_title("Fraction of Perturbations with PCC > 0", fontsize=12)
+    ax2.set_xticks(ks)
+    ax2.set_ylim(0, 1)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    path = os.path.join(output_dir, "deg_pearson_comparison.png")
+    path = os.path.join(output_dir, "deg_pearson_curve.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"  图已保存: {path}")
 
 
-def plot_per_pert_scatter(result, output_dir, other_result=None):
-    """扰动级 Pearson r 分布（箱线图或散点图）。"""
+def plot_per_pert_distribution(results_list, output_dir, k):
+    """在 top-k 固定时，各扰动 PCC 的直方图分布。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    colors = ["#3498DB", "#E74C3C", "#2ECC71", "#F39C12"]
     fig, ax = plt.subplots(figsize=(7, 5))
 
-    def add_data(res, color, label):
-        rs = [x["pearson_r"] for x in res["per_perturbation"]]
-        ax.hist(rs, bins=30, alpha=0.6, color=color, label=f"{label} (mean={np.mean(rs):.4f})",
+    for res, color in zip(results_list, colors):
+        if "per_perturbation" not in res:
+            continue
+        rs = [x["pearson_at_k"].get(k, float("nan")) for x in res["per_perturbation"]]
+        rs = [v for v in rs if not np.isnan(v)]
+        if not rs:
+            continue
+        ax.hist(rs, bins=20, alpha=0.6, color=color,
+                label=f"{res['label']} (mean={np.mean(rs):.4f})",
                 edgecolor="white", linewidth=0.5)
 
-    add_data(result, "#3498DB", result["label"])
-    if other_result and "per_perturbation" in other_result:
-        add_data(other_result, "#E74C3C", other_result["label"])
-
     ax.axvline(0, color="black", linestyle="--", linewidth=1, alpha=0.6)
-    ax.set_xlabel("Pearson r (per perturbation)", fontsize=12)
+    ax.set_xlabel(f"Pearson r at top-{k} genes (per perturbation)", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
-    ax.set_title("Per-Perturbation DEG Pearson r Distribution", fontsize=12)
+    ax.set_title(f"Per-Perturbation PCC Distribution (top-{k} by |scores|)", fontsize=12)
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    path = os.path.join(output_dir, "deg_pearson_distribution.png")
+    path = os.path.join(output_dir, f"deg_pearson_dist_top{k}.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"  图已保存: {path}")
+
+
+def plot_pcc_heatmap(results_list, output_dir):
+    """热图：行=扰动，列=k，颜色=PCC；每个模型一张图。行按 mean PCC 排序。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    for res in results_list:
+        if "per_perturbation" not in res or "pearson_curve" not in res:
+            continue
+
+        ks = sorted(res["pearson_curve"].keys())
+        rows = res["per_perturbation"]
+
+        # 构建矩阵 (n_perts × n_k)
+        pert_names = [r["perturbation"] for r in rows]
+        matrix = np.array([
+            [r["pearson_at_k"].get(k, float("nan")) for k in ks]
+            for r in rows
+        ], dtype=float)
+
+        # 按每行均值（忽略 NaN）降序排列
+        row_means = np.nanmean(matrix, axis=1)
+        order = np.argsort(row_means)[::-1]
+        matrix = matrix[order]
+        pert_names = [pert_names[i] for i in order]
+
+        vmax = max(abs(np.nanmax(matrix)), abs(np.nanmin(matrix)), 0.01)
+        norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+
+        fig_h = max(6, len(pert_names) * 0.25)
+        fig, ax = plt.subplots(figsize=(max(6, len(ks) * 0.7), fig_h))
+        im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r", norm=norm)
+
+        ax.set_xticks(range(len(ks)))
+        ax.set_xticklabels([f"top-{k}" for k in ks], fontsize=9)
+        ax.set_yticks(range(len(pert_names)))
+        ax.set_yticklabels(pert_names, fontsize=7)
+        ax.set_xlabel("Number of top genes (by |Wilcoxon scores|)", fontsize=11)
+        ax.set_title(f"Per-Perturbation PCC Heatmap — {res['label']}\n(sorted by mean PCC)", fontsize=11)
+
+        plt.colorbar(im, ax=ax, label="Pearson r", shrink=0.6)
+        plt.tight_layout()
+        label_safe = res["label"].replace(" ", "_").replace("+", "plus")
+        path = os.path.join(output_dir, f"deg_pearson_heatmap_{label_safe}.png")
+        plt.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close()
+        print(f"  图已保存: {path}")
 
 
 # ============================================================================
@@ -551,7 +624,7 @@ def main():
     print(f"\n输出目录: {output_dir}")
     print(f"数据文件: {args.h5ad}")
     print(f"扰动列: {args.pert_col}  对照标签: {args.ctrl_label}")
-    print(f"adj p 阈值: {args.pval_cutoff}  最少 DE 基因: {args.min_de_genes}")
+    print(f"DEG 选择: top-1..{args.top_k_max} by |Wilcoxon scores|  最少 DE 基因: {args.min_de_genes}")
 
     all_results = []
 
@@ -576,23 +649,22 @@ def main():
 
     # ---- 汇总 ----
     print("\n" + "=" * 70)
-    print("DEG Pearson r 汇总（谢老师方法）")
+    print("DEG Pearson r 曲线汇总（top-k by |Wilcoxon scores|）")
     print("=" * 70)
     for res in all_results:
-        if "pearson_mean" in res:
-            print(f"  {res['label']:20s}  "
-                  f"Mean={res['pearson_mean']:.4f} ± {res['pearson_std']:.4f}  "
-                  f"Median={res['pearson_median']:.4f}  "
-                  f"N={res['n_perturbations']}  "
-                  f"Positive={res['frac_positive']:.1%}")
+        if "pearson_curve" not in res:
+            continue
+        print(f"\n  [{res['label']}]  N={res['n_perturbations']} 扰动")
+        print(f"  {'k':>4}  {'mean PCC':>10}  {'median':>10}  {'std':>8}")
+        for k, stat in sorted(res["pearson_curve"].items()):
+            print(f"  {k:>4}  {stat['mean']:>10.4f}  {stat['median']:>10.4f}  {stat['std']:>8.4f}")
     print("=" * 70)
 
     # ---- 绘图 ----
-    if len(all_results) >= 1:
-        plot_comparison(all_results, output_dir)
-    if len(all_results) >= 1 and "per_perturbation" in all_results[0]:
-        other = all_results[1] if len(all_results) > 1 else None
-        plot_per_pert_scatter(all_results[0], output_dir, other)
+    if all_results:
+        plot_pcc_curve(all_results, output_dir)
+        plot_per_pert_distribution(all_results, output_dir, k=args.top_k_max)
+        plot_pcc_heatmap(all_results, output_dir)
 
     # ---- 保存 JSON ----
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

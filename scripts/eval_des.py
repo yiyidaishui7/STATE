@@ -349,10 +349,10 @@ def eval_des(model, cfg, h5_path, args, device, label="model"):
             n_skipped += 1
             continue
 
-        # 按 |log-FC| 降序取 top-k 真实 DEG
+        # 按 |Wilcoxon scores| 降序取 top-k 真实 DEG
         de_df = de_df.copy()
-        de_df["abs_logfc"] = de_df["logfoldchanges"].abs()
-        de_df = de_df.sort_values("abs_logfc", ascending=False)
+        de_df["abs_scores"] = de_df["scores"].abs()
+        de_df = de_df.sort_values("abs_scores", ascending=False)
         true_top_k = set(de_df["names"].iloc[:k].tolist())
 
         # ---- Step 2: 预测 top-k 基因（|pert_score - ctrl_score| 最大） ----
