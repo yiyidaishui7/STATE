@@ -133,10 +133,23 @@ def load_adata(h5_path):
 def load_state_model(checkpoint_path, cfg):
     from state.emb.nn.model import StateEmbeddingModel
     from state.emb.train.trainer import get_embeddings
+    from state.emb.utils import get_embedding_cfg
+
+    emb_cfg = get_embedding_cfg(cfg)
 
     print(f"  加载 checkpoint: {checkpoint_path}")
     model = StateEmbeddingModel.load_from_checkpoint(
-        checkpoint_path, dropout=0.0, strict=False, cfg=cfg, map_location="cpu"
+        checkpoint_path,
+        token_dim=emb_cfg.size,
+        d_model=cfg.model.emsize,
+        nhead=cfg.model.nhead,
+        d_hid=cfg.model.d_hid,
+        nlayers=cfg.model.nlayers,
+        output_dim=cfg.model.output_dim,
+        dropout=0.0,
+        cfg=cfg,
+        strict=False,
+        map_location="cpu",
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
