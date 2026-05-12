@@ -645,11 +645,17 @@ def plot_pcc_curve(results_list, output_dir):
     ax2.set_xlabel("Top-k genes", fontsize=12)
     ax2.set_ylabel("Fraction PCC > 0", fontsize=12)
     ax2.set_title("Fraction of Perturbations with PCC > 0", fontsize=12)
-    ax2.set_xticks(ks)
+    # 大 k 时每隔若干步显示一个刻度，避免拥挤
+    max_k = max(ks)
+    stride = 1 if max_k <= 20 else (5 if max_k <= 50 else 10)
+    ax2.set_xticks([k for k in ks if k % stride == 0 or k == min(ks)])
     ax2.set_ylim(0, 1)
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
+    n_k = max_k
+    fig_w = max(8, min(n_k * 0.4, 24))  # 宽度随 k 增长，最大 24 英寸
+    fig.set_size_inches(fig_w, 8)
     plt.tight_layout()
     path = os.path.join(output_dir, "deg_pearson_curve.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
@@ -721,11 +727,17 @@ def plot_pcc_heatmap(results_list, output_dir):
         norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
 
         fig_h = max(6, len(pert_names) * 0.25)
-        fig, ax = plt.subplots(figsize=(max(6, len(ks) * 0.7), fig_h))
+        fig_w = max(6, min(len(ks) * 0.5, 20))  # 最大 20 英寸
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
         im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r", norm=norm)
 
-        ax.set_xticks(range(len(ks)))
-        ax.set_xticklabels([f"top-{k}" for k in ks], fontsize=9)
+        # 大 k 时稀疏显示 x 轴刻度
+        max_k = max(ks)
+        stride = 1 if max_k <= 20 else (5 if max_k <= 50 else 10)
+        tick_positions = [i for i, k in enumerate(ks) if k % stride == 0 or k == min(ks)]
+        tick_labels    = [f"top-{ks[i]}" for i in tick_positions]
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, fontsize=9)
         ax.set_yticks(range(len(pert_names)))
         ax.set_yticklabels(pert_names, fontsize=7)
         ax.set_xlabel("Number of top genes (by |Wilcoxon scores|)", fontsize=11)
@@ -768,7 +780,10 @@ def plot_method_comparison(topk_results, pval_results, output_dir, pval_cutoff=0
     ax1.set_ylabel("Mean Pearson r", fontsize=11)
     ax1.set_title("Method A: Top-k PCC Curve\n(genes ranked by |Wilcoxon scores|)", fontsize=11)
     if valid_topk:
-        ax1.set_xticks(sorted(valid_topk[0]["pearson_curve"].keys()))
+        all_ks = sorted(valid_topk[0]["pearson_curve"].keys())
+        max_k = max(all_ks)
+        stride = 1 if max_k <= 20 else (5 if max_k <= 50 else 10)
+        ax1.set_xticks([k for k in all_ks if k % stride == 0 or k == min(all_ks)])
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3)
 
