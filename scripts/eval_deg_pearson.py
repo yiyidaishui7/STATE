@@ -125,10 +125,23 @@ def load_adata(h5_path):
 def load_state_model(checkpoint_path, cfg):
     from state.emb.nn.model import StateEmbeddingModel
     from state.emb.train.trainer import get_embeddings
+    from state.emb.utils import get_embedding_cfg
+
+    emb_cfg = get_embedding_cfg(cfg)
 
     print(f"  加载 checkpoint: {checkpoint_path}")
     model = StateEmbeddingModel.load_from_checkpoint(
-        checkpoint_path, dropout=0.0, strict=False, cfg=cfg, map_location="cpu"
+        checkpoint_path,
+        token_dim=emb_cfg.size,
+        d_model=cfg.model.emsize,
+        nhead=cfg.model.nhead,
+        d_hid=cfg.model.d_hid,
+        nlayers=cfg.model.nlayers,
+        output_dim=cfg.model.output_dim,
+        dropout=0.0,
+        cfg=cfg,
+        strict=False,
+        map_location="cpu",
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -463,6 +476,129 @@ def eval_deg_pearson(model, cfg, h5_path, args, device, label="model"):
     }
 
 
+def eval_deg_pearson_pval(model, cfg, h5_path, args, device, label="model",
+                          pval_cutoff=0.05):
+    """
+    传统 p-value 阈值方法：筛 adj p < pval_cutoff 的 DEG，在这些基因上算单个 PCC。
+    与 eval_deg_pearson（top-k）输出可直接对比。
+    """
+    import scanpy as sc
+    import anndata as ad
+
+    adata = load_adata(h5_path)
+    pert_labels = adata.obs[args.pert_col].astype(str).values
+    ctrl_mask = pert_labels == args.ctrl_label
+    ctrl_indices = np.where(ctrl_mask)[0]
+    if len(ctrl_indices) > args.max_cells_per_group:
+        ctrl_indices = ctrl_indices[:args.max_cells_per_group]
+
+    pert_unique = sorted([p for p in np.unique(pert_labels) if p != args.ctrl_label])
+
+    # 预计算（循环外只算一次）
+    gene_names = list(adata.var_names)
+    gene_name_to_idx = {g: i for i, g in enumerate(gene_names)}
+    with torch.no_grad():
+        gene_embs = model.get_gene_embedding(gene_names).detach().cpu()
+    ctrl_cls = encode_cells_to_cls(model, cfg, h5_path, list(ctrl_indices), args, device)
+    ctrl_cls_mean = torch.tensor(ctrl_cls.mean(axis=0), dtype=torch.float32).unsqueeze(0).to(device)
+    pred_ctrl_all = predict_from_emb(model, ctrl_cls_mean, gene_embs, args.read_depth, device)
+    actual_ctrl_mean_all = np.asarray(adata.X[ctrl_indices].mean(axis=0)).ravel()
+
+    pearson_list = []
+    results_per_pert = []
+    n_skipped = 0
+
+    for pert in tqdm(pert_unique, desc=f"  [{label}] pval<{pval_cutoff}"):
+        pert_mask = pert_labels == pert
+        pert_indices = np.where(pert_mask)[0]
+        if len(pert_indices) < 5:
+            n_skipped += 1
+            continue
+        if len(pert_indices) > args.max_cells_per_group:
+            pert_indices = pert_indices[:args.max_cells_per_group]
+
+        # Wilcoxon + BH 校正，筛 adj p < pval_cutoff
+        adata_ctrl = adata[ctrl_indices].copy()
+        adata_pert = adata[pert_indices].copy()
+        adata_ctrl.obs["_group"] = "control"
+        adata_pert.obs["_group"] = "perturbed"
+        adata_combined = ad.concat([adata_ctrl, adata_pert])
+        try:
+            sc.tl.rank_genes_groups(
+                adata_combined, groupby="_group", groups=["perturbed"],
+                reference="control", method="wilcoxon",
+                corr_method="benjamini-hochberg", tie_correct=True, use_raw=False,
+            )
+            de_df = sc.get.rank_genes_groups_df(
+                adata_combined, group="perturbed", pval_cutoff=pval_cutoff
+            )
+        except Exception:
+            n_skipped += 1
+            continue
+
+        if de_df is None or len(de_df) < args.min_de_genes:
+            n_skipped += 1
+            continue
+
+        de_genes = de_df["names"].tolist()
+        idx_de = np.array([gene_name_to_idx[g] for g in de_genes if g in gene_name_to_idx])
+        if len(idx_de) < 2:
+            n_skipped += 1
+            continue
+
+        # 模型预测
+        try:
+            pert_cls = encode_cells_to_cls(model, cfg, h5_path, list(pert_indices), args, device)
+        except Exception:
+            n_skipped += 1
+            continue
+        pert_cls_mean = torch.tensor(pert_cls.mean(axis=0), dtype=torch.float32).unsqueeze(0).to(device)
+        pred_pert_all = predict_from_emb(model, pert_cls_mean, gene_embs, args.read_depth, device)
+
+        actual_pert_mean_all = np.asarray(adata.X[pert_indices].mean(axis=0)).ravel()
+        actual_logfc = actual_pert_mean_all[idx_de] - actual_ctrl_mean_all[idx_de]
+        pred_logfc   = pred_pert_all[idx_de]        - pred_ctrl_all[idx_de]
+
+        valid = ~(np.isnan(actual_logfc) | np.isnan(pred_logfc))
+        if valid.sum() < 2:
+            n_skipped += 1
+            continue
+        try:
+            r, _ = pearsonr(pred_logfc[valid], actual_logfc[valid])
+            r = float(r) if not np.isnan(r) else float("nan")
+        except Exception:
+            r = float("nan")
+
+        pearson_list.append(r)
+        results_per_pert.append({
+            "perturbation": pert,
+            "n_de_genes": len(idx_de),
+            "pearson_r": r,
+        })
+
+    print(f"\n  完成 {len(results_per_pert)} 个扰动（跳过 {n_skipped} 个）")
+
+    vals = [v for v in pearson_list if not np.isnan(v)]
+    if not vals:
+        return {"label": label, "method": f"pval<{pval_cutoff}", "error": "no valid perturbations"}
+
+    m, med, s = float(np.mean(vals)), float(np.median(vals)), float(np.std(vals))
+    frac_pos = float(np.mean(np.array(vals) > 0))
+    print(f"  Mean={m:.4f}  Median={med:.4f}  Std={s:.4f}  "
+          f"N={len(vals)}  Positive={frac_pos:.1%}")
+
+    return {
+        "label": label,
+        "method": f"pval<{pval_cutoff}",
+        "pearson_mean": m,
+        "pearson_median": med,
+        "pearson_std": s,
+        "frac_positive": frac_pos,
+        "n_perturbations": len(vals),
+        "per_perturbation": results_per_pert,
+    }
+
+
 # ============================================================================
 # 绘图
 # ============================================================================
@@ -604,6 +740,65 @@ def plot_pcc_heatmap(results_list, output_dir):
         print(f"  图已保存: {path}")
 
 
+def plot_method_comparison(topk_results, pval_results, output_dir, pval_cutoff=0.05):
+    """
+    对比图：左=top-k PCC 曲线，右=p-value 阈值法各模型 mean PCC 柱状图。
+    直观展示两种评估方法的差异。
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    colors = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12"]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ---- 左图：top-k PCC 曲线 ----
+    valid_topk = [r for r in topk_results if "pearson_curve" in r]
+    for r, color in zip(valid_topk, colors):
+        curve = r["pearson_curve"]
+        ks = sorted(curve.keys())
+        means = np.array([curve[k]["mean"] for k in ks], dtype=float)
+        stds  = np.array([curve[k]["std"]  for k in ks], dtype=float)
+        ax1.plot(ks, means, marker="o", color=color, label=r["label"], linewidth=2, markersize=5)
+        ax1.fill_between(ks, means - stds, means + stds, color=color, alpha=0.12)
+
+    ax1.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
+    ax1.set_xlabel("Top-k genes (by |Wilcoxon scores|)", fontsize=11)
+    ax1.set_ylabel("Mean Pearson r", fontsize=11)
+    ax1.set_title("Method A: Top-k PCC Curve\n(genes ranked by |Wilcoxon scores|)", fontsize=11)
+    if valid_topk:
+        ax1.set_xticks(sorted(valid_topk[0]["pearson_curve"].keys()))
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+
+    # ---- 右图：p-value 阈值法柱状图 ----
+    valid_pval = [r for r in pval_results if "pearson_mean" in r]
+    labels  = [r["label"] for r in valid_pval]
+    means   = [r["pearson_mean"] for r in valid_pval]
+    stds    = [r["pearson_std"]  for r in valid_pval]
+    bar_colors = colors[:len(labels)]
+
+    bars = ax2.bar(labels, means, color=bar_colors, alpha=0.85,
+                   yerr=stds, capsize=5, error_kw={"linewidth": 1.2})
+    ax2.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
+    for bar, m in zip(bars, means):
+        ax2.text(bar.get_x() + bar.get_width() / 2,
+                 m + (0.01 if m >= 0 else -0.03),
+                 f"{m:.4f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax2.set_ylabel("Mean Pearson r", fontsize=11)
+    ax2.set_title(f"Method B: p-value Threshold\n(adj p < {pval_cutoff}, all DEGs)", fontsize=11)
+    ax2.grid(True, alpha=0.3, axis="y")
+
+    plt.suptitle("Two Evaluation Methods: Top-k PCC vs. p-value Threshold",
+                 fontsize=12, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    path = os.path.join(output_dir, f"method_comparison_pval{pval_cutoff}.png")
+    plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  图已保存: {path}")
+
+
 # ============================================================================
 # 主流程
 # ============================================================================
@@ -626,52 +821,82 @@ def main():
     print(f"扰动列: {args.pert_col}  对照标签: {args.ctrl_label}")
     print(f"DEG 选择: top-1..{args.top_k_max} by |Wilcoxon scores|  最少 DE 基因: {args.min_de_genes}")
 
-    all_results = []
+    topk_results = []   # top-k PCC 曲线
+    pval_results  = []  # p-value 阈值方法
 
-    # ---- 主 checkpoint ----
-    print(f"\n{'='*60}\n[1] STATE+MMD\n{'='*60}")
+    # ---- 主 checkpoint：两种方法都跑 ----
+    print(f"\n{'='*60}\n[1] STATE+MMD — top-k PCC\n{'='*60}")
     model, device = load_state_model(args.checkpoint, cfg)
     res_main = eval_deg_pearson(model, cfg, args.h5ad, args, device, label="STATE+MMD")
     if res_main:
-        all_results.append(res_main)
+        topk_results.append(res_main)
+
+    print(f"\n{'='*60}\n[1] STATE+MMD — pval<{args.pval_cutoff}\n{'='*60}")
+    res_main_pval = eval_deg_pearson_pval(
+        model, cfg, args.h5ad, args, device,
+        label="STATE+MMD", pval_cutoff=args.pval_cutoff,
+    )
+    if res_main_pval:
+        pval_results.append(res_main_pval)
     del model
     torch.cuda.empty_cache()
 
-    # ---- 基线 checkpoint ----
+    # ---- 基线 checkpoint：两种方法都跑 ----
     if args.baseline:
-        print(f"\n{'='*60}\n[2] Baseline\n{'='*60}")
+        print(f"\n{'='*60}\n[2] Baseline — top-k PCC\n{'='*60}")
         model_base, device = load_state_model(args.baseline, cfg)
         res_base = eval_deg_pearson(model_base, cfg, args.h5ad, args, device, label="Baseline")
         if res_base:
-            all_results.append(res_base)
+            topk_results.append(res_base)
+
+        print(f"\n{'='*60}\n[2] Baseline — pval<{args.pval_cutoff}\n{'='*60}")
+        res_base_pval = eval_deg_pearson_pval(
+            model_base, cfg, args.h5ad, args, device,
+            label="Baseline", pval_cutoff=args.pval_cutoff,
+        )
+        if res_base_pval:
+            pval_results.append(res_base_pval)
         del model_base
         torch.cuda.empty_cache()
 
-    # ---- 汇总 ----
+    # ---- 汇总打印 ----
     print("\n" + "=" * 70)
-    print("DEG Pearson r 曲线汇总（top-k by |Wilcoxon scores|）")
+    print("方法 A：Top-k PCC 曲线（|Wilcoxon scores| 排序）")
     print("=" * 70)
-    for res in all_results:
+    for res in topk_results:
         if "pearson_curve" not in res:
             continue
         print(f"\n  [{res['label']}]  N={res['n_perturbations']} 扰动")
         print(f"  {'k':>4}  {'mean PCC':>10}  {'median':>10}  {'std':>8}")
         for k, stat in sorted(res["pearson_curve"].items()):
             print(f"  {k:>4}  {stat['mean']:>10.4f}  {stat['median']:>10.4f}  {stat['std']:>8.4f}")
+
+    print("\n" + "=" * 70)
+    print(f"方法 B：p-value 阈值法（adj p < {args.pval_cutoff}，全部 DEG）")
+    print("=" * 70)
+    for res in pval_results:
+        if "pearson_mean" not in res:
+            continue
+        print(f"  [{res['label']}]  Mean={res['pearson_mean']:.4f}  "
+              f"Std={res['pearson_std']:.4f}  N={res['n_perturbations']}  "
+              f"Positive={res['frac_positive']:.1%}")
     print("=" * 70)
 
     # ---- 绘图 ----
-    if all_results:
-        plot_pcc_curve(all_results, output_dir)
-        plot_per_pert_distribution(all_results, output_dir, k=args.top_k_max)
-        plot_pcc_heatmap(all_results, output_dir)
+    all_topk = topk_results
+    if all_topk:
+        plot_pcc_curve(all_topk, output_dir)
+        plot_per_pert_distribution(all_topk, output_dir, k=args.top_k_max)
+        plot_pcc_heatmap(all_topk, output_dir)
+    if all_topk and pval_results:
+        plot_method_comparison(all_topk, pval_results, output_dir, args.pval_cutoff)
 
     # ---- 保存 JSON ----
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    all_combined = {"topk": topk_results, "pval": pval_results}
     json_path = os.path.join(output_dir, f"deg_pearson_{ts}.json")
     with open(json_path, "w") as f:
-        # per_perturbation 可能很长，但保留供后续分析
-        json.dump(all_results, f, indent=2, default=str)
+        json.dump(all_combined, f, indent=2, default=str)
     print(f"\n结果已保存: {json_path}")
     print("评估完成")
 
