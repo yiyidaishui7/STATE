@@ -604,59 +604,105 @@ def eval_deg_pearson_pval(model, cfg, h5_path, args, device, label="model",
 # ============================================================================
 
 def plot_pcc_curve(results_list, output_dir):
-    """双子图：上=mean PCC 折线 + std 阴影，下=正相关比例折线。"""
+    """双子图：上=mean PCC（SEM阴影+三阶段标注），下=正相关比例。从 k=3 开始绘制。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
 
     valid = [r for r in results_list if "pearson_curve" in r]
     if not valid:
         return
 
     colors = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12"]
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+    markers = ["o", "s", "^", "D"]
 
-    for r, color in zip(valid, colors):
+    # 确定 x 范围（从 k=3 开始，跳过 k=1 NaN 和 k=2 artifact）
+    all_ks_raw = sorted(valid[0]["pearson_curve"].keys())
+    ks = [k for k in all_ks_raw if k >= 3]
+    max_k = max(ks)
+
+    fig_w = max(10, min(max_k * 0.35, 22))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(fig_w, 9), sharex=True)
+
+    # ---- 三阶段背景色带 ----
+    # 信号峰 k=3~5：浅绿；衰减区 k=6~15：浅黄；平台区 k=16+：浅蓝
+    stage_defs = []
+    if max_k >= 3:
+        stage_defs.append((3, min(5, max_k),   "#d5f5e3", "Signal\nPeak"))
+    if max_k >= 6:
+        stage_defs.append((6, min(15, max_k),  "#fef9e7", "Decay"))
+    if max_k >= 16:
+        stage_defs.append((16, max_k,           "#eaf4fb", "Plateau"))
+
+    for (x0, x1, fc, label) in stage_defs:
+        for ax in (ax1, ax2):
+            ax.axvspan(x0 - 0.5, x1 + 0.5, color=fc, alpha=0.6, zorder=0)
+        # 在上图顶部标注阶段名
+        ax1.text((x0 + x1) / 2, 1.01, label,
+                 ha="center", va="bottom", fontsize=8, color="#555555",
+                 transform=ax1.get_xaxis_transform())
+
+    for r, color, mkr in zip(valid, colors, markers):
         curve = r["pearson_curve"]
-        ks = sorted(curve.keys())
-        means  = np.array([curve[k]["mean"] for k in ks], dtype=float)
-        stds   = np.array([curve[k]["std"]  for k in ks], dtype=float)
+        means = np.array([curve[k]["mean"] for k in ks], dtype=float)
+        stds  = np.array([curve[k]["std"]  for k in ks], dtype=float)
+        n_valid = np.array([curve[k].get("n_valid", 67) for k in ks], dtype=float)
+        sem   = stds / np.sqrt(np.maximum(n_valid, 1))
 
-        # 上图：mean PCC + std 阴影
-        ax1.plot(ks, means, marker="o", color=color, label=r["label"], linewidth=2, markersize=5)
-        ax1.fill_between(ks, means - stds, means + stds, color=color, alpha=0.15)
+        ax1.plot(ks, means, marker=mkr, color=color, label=r["label"],
+                 linewidth=2.5, markersize=6, zorder=3)
+        ax1.fill_between(ks, means - sem, means + sem, color=color, alpha=0.25, zorder=2)
 
-        # 下图：每个 k 下 PCC > 0 的扰动比例
+        # 标注 k=3 和平台区均值
+        if len(means) > 0 and not np.isnan(means[0]):
+            ax1.annotate(f"{means[0]:+.3f}",
+                         xy=(ks[0], means[0]),
+                         xytext=(ks[0] + 0.3, means[0] + 0.01),
+                         fontsize=8, color=color, fontweight="bold")
+        if max_k >= 16:
+            plateau_idx = [i for i, k in enumerate(ks) if k >= 16]
+            if plateau_idx:
+                plateau_mean = float(np.nanmean(means[plateau_idx]))
+                ax1.axhline(plateau_mean, color=color, linestyle=":",
+                            linewidth=1.2, alpha=0.7)
+                ax1.text(max_k + 0.3, plateau_mean, f"{plateau_mean:+.3f}",
+                         color=color, fontsize=8, va="center")
+
+        # 下图：正相关比例
         frac_pos = []
         for k in ks:
             vals = [x["pearson_at_k"].get(k, float("nan"))
                     for x in r.get("per_perturbation", [])
                     if not np.isnan(x["pearson_at_k"].get(k, float("nan")))]
             frac_pos.append(np.mean(np.array(vals) > 0) if vals else float("nan"))
-        ax2.plot(ks, frac_pos, marker="s", color=color, label=r["label"], linewidth=2, markersize=5)
+        ax2.plot(ks, frac_pos, marker=mkr, color=color, label=r["label"],
+                 linewidth=2.5, markersize=6, zorder=3)
 
-    ax1.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax1.axhline(0, color="gray", linestyle="--", linewidth=1.0, alpha=0.7, zorder=1)
     ax1.set_ylabel("Mean Pearson r", fontsize=12)
-    ax1.set_title("DEG Pearson r vs. Number of Top Genes (ranked by |Wilcoxon scores|)", fontsize=12)
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    ax1.set_title("Top-k PCC Curve  (genes ranked by |Wilcoxon scores|, SEM shading)",
+                  fontsize=12, fontweight="bold")
+    ax1.legend(fontsize=10, loc="upper right")
+    ax1.grid(True, alpha=0.25)
 
-    ax2.axhline(0.5, color="gray", linestyle="--", linewidth=0.8, alpha=0.6, label="random (50%)")
+    ax2.axhline(0.5, color="gray", linestyle="--", linewidth=1.0,
+                alpha=0.7, label="random (50%)", zorder=1)
     ax2.set_xlabel("Top-k genes", fontsize=12)
     ax2.set_ylabel("Fraction PCC > 0", fontsize=12)
-    ax2.set_title("Fraction of Perturbations with PCC > 0", fontsize=12)
-    # 大 k 时每隔若干步显示一个刻度，避免拥挤
-    max_k = max(ks)
+    ax2.set_title("Fraction of Perturbations with Positive PCC", fontsize=12)
     stride = 1 if max_k <= 20 else (5 if max_k <= 50 else 10)
     ax2.set_xticks([k for k in ks if k % stride == 0 or k == min(ks)])
-    ax2.set_ylim(0, 1)
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(0.2, 0.85)
+    ax2.legend(fontsize=10, loc="upper right")
+    ax2.grid(True, alpha=0.25)
 
-    n_k = max_k
-    fig_w = max(8, min(n_k * 0.4, 24))  # 宽度随 k 增长，最大 24 英寸
-    fig.set_size_inches(fig_w, 8)
-    plt.tight_layout()
+    # 添加 k=2 artifact 说明
+    fig.text(0.01, 0.01,
+             "Note: k=1 (undefined) and k=2 (mathematical artifact, pearsonr≡±1) omitted.",
+             fontsize=8, color="#888888")
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
     path = os.path.join(output_dir, "deg_pearson_curve.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
@@ -664,32 +710,95 @@ def plot_pcc_curve(results_list, output_dir):
 
 
 def plot_per_pert_distribution(results_list, output_dir, k):
-    """在 top-k 固定时，各扰动 PCC 的直方图分布。"""
+    """多 k violin 图：在信号峰/衰减/平台各取代表性 k，展示跨扰动 PCC 分布演变。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colors = ["#3498DB", "#E74C3C", "#2ECC71", "#F39C12"]
-    fig, ax = plt.subplots(figsize=(7, 5))
+    valid = [r for r in results_list if "per_perturbation" in r and "pearson_curve" in r]
+    if not valid:
+        return
 
-    for res, color in zip(results_list, colors):
-        if "per_perturbation" not in res:
-            continue
-        rs = [x["pearson_at_k"].get(k, float("nan")) for x in res["per_perturbation"]]
-        rs = [v for v in rs if not np.isnan(v)]
-        if not rs:
-            continue
-        ax.hist(rs, bins=20, alpha=0.6, color=color,
-                label=f"{res['label']} (mean={np.mean(rs):.4f})",
-                edgecolor="white", linewidth=0.5)
+    # 根据 k_max 选代表性 k 值
+    all_ks = sorted(valid[0]["pearson_curve"].keys())
+    max_k = max(all_ks)
+    candidates = [3, 5, 10, 15, 20, 25, 30, 40, 50]
+    show_ks = [kk for kk in candidates if kk <= max_k and kk >= 3]
+    if not show_ks:
+        show_ks = [kk for kk in all_ks if kk >= 3][:6]
 
-    ax.axvline(0, color="black", linestyle="--", linewidth=1, alpha=0.6)
-    ax.set_xlabel(f"Pearson r at top-{k} genes (per perturbation)", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title(f"Per-Perturbation PCC Distribution (top-{k} by |scores|)", fontsize=12)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
+    colors = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12"]
+    n_models = len(valid)
+    n_ks = len(show_ks)
+
+    fig, axes = plt.subplots(1, n_ks, figsize=(max(10, n_ks * 2.2), 5.5), sharey=True)
+    if n_ks == 1:
+        axes = [axes]
+
+    # 阶段背景色
+    def stage_color(kk):
+        if kk <= 5:   return "#d5f5e3"
+        if kk <= 15:  return "#fef9e7"
+        return "#eaf4fb"
+
+    def stage_label(kk):
+        if kk <= 5:   return "Peak"
+        if kk <= 15:  return "Decay"
+        return "Plateau"
+
+    for col, kk in enumerate(show_ks):
+        ax = axes[col]
+        ax.set_facecolor(stage_color(kk))
+
+        data_per_model = []
+        for res in valid:
+            rs = [x["pearson_at_k"].get(kk, float("nan")) for x in res["per_perturbation"]]
+            rs = [v for v in rs if not np.isnan(v)]
+            data_per_model.append(rs)
+
+        # violin + strip
+        positions = list(range(n_models))
+        parts = ax.violinplot(data_per_model, positions=positions,
+                              showmedians=True, showextrema=False, widths=0.7)
+        for i, (pc, color) in enumerate(zip(parts["bodies"], colors)):
+            pc.set_facecolor(color)
+            pc.set_alpha(0.55)
+        parts["cmedians"].set_color("black")
+        parts["cmedians"].set_linewidth(2)
+
+        for i, (rs, color) in enumerate(zip(data_per_model, colors)):
+            jitter = np.random.default_rng(42).uniform(-0.12, 0.12, len(rs))
+            ax.scatter([i + j for j in jitter], rs, color=color,
+                       alpha=0.4, s=12, zorder=3)
+            mean_val = np.mean(rs) if rs else float("nan")
+            ax.text(i, ax.get_ylim()[0] if col == 0 else -1.05,
+                    f"μ={mean_val:+.3f}", ha="center", fontsize=7.5,
+                    color=color, fontweight="bold",
+                    transform=ax.get_xaxis_transform() if col == 0 else ax.transData)
+
+        ax.axhline(0, color="gray", linestyle="--", linewidth=0.9, alpha=0.7)
+        ax.set_xticks(positions)
+        ax.set_xticklabels([r["label"].replace(" ", "\n") for r in valid], fontsize=8)
+        ax.set_title(f"k = {kk}\n({stage_label(kk)})", fontsize=9, fontweight="bold")
+        ax.grid(True, alpha=0.2, axis="y")
+
+    axes[0].set_ylabel("Pearson r (per perturbation)", fontsize=11)
+
+    # 在每个 violin 下方统一标注 mean（用 fig.text 避开 transform 问题）
+    for col, (ax, kk) in enumerate(zip(axes, show_ks)):
+        for i, (res, color) in enumerate(zip(valid, colors)):
+            rs = [x["pearson_at_k"].get(kk, float("nan")) for x in res["per_perturbation"]]
+            rs = [v for v in rs if not np.isnan(v)]
+            mean_val = np.mean(rs) if rs else float("nan")
+            ax.text(i, -1.12, f"μ={mean_val:+.3f}",
+                    ha="center", va="top", fontsize=7.5,
+                    color=color, fontweight="bold",
+                    transform=ax.get_xaxis_transform())
+
+    fig.suptitle("Per-Perturbation PCC Distribution at Selected k Values\n"
+                 "(green=Signal Peak, yellow=Decay, blue=Plateau)",
+                 fontsize=11, fontweight="bold")
+    plt.tight_layout(rect=[0, 0.06, 1, 1])
     path = os.path.join(output_dir, f"deg_pearson_dist_top{k}.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
@@ -723,27 +832,64 @@ def plot_pcc_heatmap(results_list, output_dir):
         matrix = matrix[order]
         pert_names = [pert_names[i] for i in order]
 
-        vmax = max(abs(np.nanmax(matrix)), abs(np.nanmin(matrix)), 0.01)
+        max_k = max(ks)
+
+        # k 较多时只保留代表性列，避免热图过窄
+        if max_k > 20:
+            key_ks = sorted(set(
+                [k for k in ks if k <= 10] +
+                [k for k in ks if k > 10 and k % 5 == 0]
+            ))
+            col_idx = [ks.index(k) for k in key_ks]
+            display_matrix = matrix[:, col_idx]
+            display_ks = key_ks
+        else:
+            display_matrix = matrix
+            display_ks = ks
+
+        vmax = max(abs(np.nanmax(display_matrix)), abs(np.nanmin(display_matrix)), 0.01)
+        # 固定 vmax 上限到 1.0（PCC 范围），让颜色对应真实 PCC 量级
+        vmax = min(vmax, 1.0)
         norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
 
-        fig_h = max(6, len(pert_names) * 0.25)
-        fig_w = max(6, min(len(ks) * 0.5, 20))  # 最大 20 英寸
+        n_cols = len(display_ks)
+        fig_h = max(6, len(pert_names) * 0.22)
+        fig_w = max(6, min(n_cols * 0.55 + 2, 18))
         fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r", norm=norm)
+        im = ax.imshow(display_matrix, aspect="auto", cmap="RdBu_r", norm=norm)
 
-        # 大 k 时稀疏显示 x 轴刻度
-        max_k = max(ks)
-        stride = 1 if max_k <= 20 else (5 if max_k <= 50 else 10)
-        tick_positions = [i for i, k in enumerate(ks) if k % stride == 0 or k == min(ks)]
-        tick_labels    = [f"top-{ks[i]}" for i in tick_positions]
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, fontsize=9)
+        # 绘制阶段分割竖线
+        stage_boundaries = [5.5, 15.5]  # 列值（x坐标）的分割点
+        for boundary in stage_boundaries:
+            col_positions = [i for i, k in enumerate(display_ks) if k <= boundary]
+            if col_positions and col_positions[-1] < n_cols - 1:
+                ax.axvline(col_positions[-1] + 0.5, color="black",
+                           linewidth=1.5, linestyle="--", alpha=0.5)
+
+        ax.set_xticks(range(n_cols))
+        ax.set_xticklabels([f"k={k}" for k in display_ks], fontsize=8, rotation=45, ha="right")
         ax.set_yticks(range(len(pert_names)))
         ax.set_yticklabels(pert_names, fontsize=7)
         ax.set_xlabel("Number of top genes (by |Wilcoxon scores|)", fontsize=11)
-        ax.set_title(f"Per-Perturbation PCC Heatmap — {res['label']}\n(sorted by mean PCC)", fontsize=11)
+        ax.set_title(
+            f"Per-Perturbation PCC Heatmap — {res['label']}\n"
+            f"(rows sorted by mean PCC  |  dashed lines = stage boundaries)",
+            fontsize=11, fontweight="bold"
+        )
 
-        plt.colorbar(im, ax=ax, label="Pearson r", shrink=0.6)
+        cbar = plt.colorbar(im, ax=ax, label="Pearson r", shrink=0.6)
+        cbar.set_label("Pearson r", fontsize=10)
+
+        # 顶部标注阶段名
+        stage_spans = [(3, 5, "Peak"), (6, 15, "Decay"), (16, max_k, "Plateau")]
+        for (s_start, s_end, s_name) in stage_spans:
+            cols_in = [i for i, k in enumerate(display_ks) if s_start <= k <= s_end]
+            if cols_in:
+                mid = (cols_in[0] + cols_in[-1]) / 2
+                ax.text(mid, -1.5, s_name, ha="center", va="bottom",
+                        fontsize=8, color="#444444",
+                        transform=ax.get_xaxis_transform())
+
         plt.tight_layout()
         label_safe = res["label"].replace(" ", "_").replace("+", "plus")
         path = os.path.join(output_dir, f"deg_pearson_heatmap_{label_safe}.png")
@@ -762,51 +908,77 @@ def plot_method_comparison(topk_results, pval_results, output_dir, pval_cutoff=0
     import matplotlib.pyplot as plt
 
     colors = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12"]
+    markers = ["o", "s", "^", "D"]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    # ---- 左图：top-k PCC 曲线 ----
     valid_topk = [r for r in topk_results if "pearson_curve" in r]
-    for r, color in zip(valid_topk, colors):
-        curve = r["pearson_curve"]
-        ks = sorted(curve.keys())
-        means = np.array([curve[k]["mean"] for k in ks], dtype=float)
-        stds  = np.array([curve[k]["std"]  for k in ks], dtype=float)
-        ax1.plot(ks, means, marker="o", color=color, label=r["label"], linewidth=2, markersize=5)
-        ax1.fill_between(ks, means - stds, means + stds, color=color, alpha=0.12)
-
-    ax1.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
-    ax1.set_xlabel("Top-k genes (by |Wilcoxon scores|)", fontsize=11)
-    ax1.set_ylabel("Mean Pearson r", fontsize=11)
-    ax1.set_title("Method A: Top-k PCC Curve\n(genes ranked by |Wilcoxon scores|)", fontsize=11)
-    if valid_topk:
-        all_ks = sorted(valid_topk[0]["pearson_curve"].keys())
-        max_k = max(all_ks)
-        stride = 1 if max_k <= 20 else (5 if max_k <= 50 else 10)
-        ax1.set_xticks([k for k in all_ks if k % stride == 0 or k == min(all_ks)])
-    ax1.legend(fontsize=9)
-    ax1.grid(True, alpha=0.3)
-
-    # ---- 右图：p-value 阈值法柱状图 ----
     valid_pval = [r for r in pval_results if "pearson_mean" in r]
-    labels  = [r["label"] for r in valid_pval]
-    means   = [r["pearson_mean"] for r in valid_pval]
-    stds    = [r["pearson_std"]  for r in valid_pval]
-    bar_colors = colors[:len(labels)]
 
-    bars = ax2.bar(labels, means, color=bar_colors, alpha=0.85,
-                   yerr=stds, capsize=5, error_kw={"linewidth": 1.2})
-    ax2.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.7)
-    for bar, m in zip(bars, means):
-        ax2.text(bar.get_x() + bar.get_width() / 2,
-                 m + (0.01 if m >= 0 else -0.03),
-                 f"{m:.4f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
-    ax2.set_ylabel("Mean Pearson r", fontsize=11)
-    ax2.set_title(f"Method B: p-value Threshold\n(adj p < {pval_cutoff}, all DEGs)", fontsize=11)
-    ax2.grid(True, alpha=0.3, axis="y")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.5))
 
-    plt.suptitle("Two Evaluation Methods: Top-k PCC vs. p-value Threshold",
-                 fontsize=12, fontweight="bold", y=1.02)
+    # ---- 左图：top-k PCC 曲线（SEM 阴影，从 k=3 开始） ----
+    if valid_topk:
+        all_ks_raw = sorted(valid_topk[0]["pearson_curve"].keys())
+        ks = [k for k in all_ks_raw if k >= 3]
+        max_k = max(ks)
+
+        # 阶段背景
+        for (x0, x1, fc) in [(3, min(5, max_k), "#d5f5e3"),
+                              (6, min(15, max_k), "#fef9e7"),
+                              (16, max_k, "#eaf4fb")]:
+            if x0 <= max_k:
+                ax1.axvspan(x0 - 0.5, x1 + 0.5, color=fc, alpha=0.6, zorder=0)
+
+        for r, color, mkr in zip(valid_topk, colors, markers):
+            curve = r["pearson_curve"]
+            means = np.array([curve[k]["mean"] for k in ks], dtype=float)
+            stds  = np.array([curve[k]["std"]  for k in ks], dtype=float)
+            n_v   = np.array([curve[k].get("n_valid", 67) for k in ks], dtype=float)
+            sem   = stds / np.sqrt(np.maximum(n_v, 1))
+            ax1.plot(ks, means, marker=mkr, color=color, label=r["label"],
+                     linewidth=2.5, markersize=5, zorder=3)
+            ax1.fill_between(ks, means - sem, means + sem, color=color, alpha=0.2, zorder=2)
+            # 标注 k=3 值
+            if not np.isnan(means[0]):
+                ax1.annotate(f"{means[0]:+.3f}", xy=(ks[0], means[0]),
+                             xytext=(ks[0] + 0.5, means[0] + 0.012),
+                             fontsize=8, color=color, fontweight="bold")
+
+        ax1.axhline(0, color="gray", linestyle="--", linewidth=1.0, alpha=0.7, zorder=1)
+        stride = 1 if max_k <= 20 else (5 if max_k <= 50 else 10)
+        ax1.set_xticks([k for k in ks if k % stride == 0 or k == min(ks)])
+        ax1.set_xlabel("Top-k genes (by |Wilcoxon scores|)", fontsize=11)
+        ax1.set_ylabel("Mean Pearson r", fontsize=11)
+        ax1.set_title("Method A: Top-k PCC Curve\n(SEM shading; Peak / Decay / Plateau zones)",
+                      fontsize=11, fontweight="bold")
+        ax1.legend(fontsize=9)
+        ax1.grid(True, alpha=0.25)
+
+    # ---- 右图：p-value 阈值法柱状图（SEM 误差棒而非 std）----
+    if valid_pval:
+        labels     = [r["label"] for r in valid_pval]
+        means_pval = np.array([r["pearson_mean"] for r in valid_pval])
+        stds_pval  = np.array([r["pearson_std"]  for r in valid_pval])
+        ns_pval    = np.array([r.get("n_perturbations", 39) for r in valid_pval], dtype=float)
+        sem_pval   = stds_pval / np.sqrt(np.maximum(ns_pval, 1))
+        bar_colors = colors[:len(labels)]
+
+        bars = ax2.bar(labels, means_pval, color=bar_colors, alpha=0.80,
+                       yerr=sem_pval, capsize=6,
+                       error_kw={"linewidth": 1.5, "capthick": 1.5})
+        ax2.axhline(0, color="gray", linestyle="--", linewidth=1.0, alpha=0.7)
+        for bar, m, n in zip(bars, means_pval, ns_pval):
+            offset = 0.004 if m >= 0 else -0.006
+            ax2.text(bar.get_x() + bar.get_width() / 2, m + offset,
+                     f"{m:.4f}\n(N={int(n)})",
+                     ha="center", va="bottom", fontsize=9, fontweight="bold")
+        ax2.set_ylabel("Mean Pearson r", fontsize=11)
+        ax2.set_title(f"Method B: p-value Threshold  (adj p < {pval_cutoff})\n"
+                      f"Error bars = SEM  |  Skips {68 - int(ns_pval.max())}/68 perturbations",
+                      fontsize=11, fontweight="bold")
+        ax2.grid(True, alpha=0.25, axis="y")
+
+    plt.suptitle("Evaluation Method Comparison: Top-k PCC vs. p-value Threshold",
+                 fontsize=13, fontweight="bold", y=1.02)
     plt.tight_layout()
     path = os.path.join(output_dir, f"method_comparison_pval{pval_cutoff}.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
