@@ -74,8 +74,8 @@ def parse_args():
     p.add_argument("--ctrl_label", default="non-targeting", help="对照组标签")
     p.add_argument("--top_k", type=int, default=50,
                    help="top-k 基因数（DES 计算窗口，默认 50）")
-    p.add_argument("--pval_cutoff", type=float, default=0.20,
-                   help="Wilcoxon adj p 阈值（筛选真实 DEG，默认 0.20）")
+    p.add_argument("--pval_cutoff", type=float, default=0.05,
+                   help="Wilcoxon adj p 阈值（筛选真实 DEG，默认 0.05）")
     p.add_argument("--min_de_genes", type=int, default=3,
                    help="最少真实 DEG 数才评估（默认 3）")
     p.add_argument("--max_cells_per_group", type=int, default=200,
