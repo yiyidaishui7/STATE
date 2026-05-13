@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-plot_topk_curve.py — 画 Top-k PCC 折线图（run4 数据，k=3~50）
+plot_topk_curve.py — Top-k PCC 折线图（run4 + run5 对比，k=3~50）
 
-数据来源：2026-05-13 run4 终端输出，已记录在 docs/deg_experiments_0513.md
-不需要重新跑实验，直接用已有数据。
+数据来源：
+  run4 — 2026-05-13 第四次运行，记录于 docs/deg_experiments_0513.md
+  run5 — 2026-05-13 第五次运行，终端输出
 
 用法：
     python scripts/plot_topk_curve.py
@@ -11,13 +12,11 @@ plot_topk_curve.py — 画 Top-k PCC 折线图（run4 数据，k=3~50）
 """
 
 import argparse
-import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
-# ── run4 数据（来自 docs/deg_experiments_0513.md） ──────────────────────────
+# ── run4 数据 ────────────────────────────────────────────────────────────────
 
-MMD_DATA = {
+MMD_R4 = {
     3: +0.1143, 4: +0.0827, 5: +0.1028, 6: +0.0557, 7: +0.0442,
     8: +0.0400, 9: +0.0333, 10: +0.0549, 11: +0.0368, 12: +0.0560,
     13: +0.0612, 14: +0.0499, 15: +0.0431, 16: +0.0436, 17: +0.0416,
@@ -30,7 +29,7 @@ MMD_DATA = {
     48: +0.0557, 49: +0.0557, 50: +0.0563,
 }
 
-BASELINE_DATA = {
+BL_R4 = {
     3: -0.0194, 4: +0.0030, 5: +0.0190, 6: +0.0082, 7: +0.0250,
     8: +0.0358, 9: +0.0204, 10: +0.0328, 11: +0.0514, 12: +0.0396,
     13: +0.0335, 14: +0.0381, 15: +0.0401, 16: +0.0440, 17: +0.0266,
@@ -43,49 +42,67 @@ BASELINE_DATA = {
     48: +0.0272, 49: +0.0273, 50: +0.0243,
 }
 
-# ── 主函数 ──────────────────────────────────────────────────────────────────
+# ── run5 数据（2026-05-13 最新一次运行）──────────────────────────────────────
+
+MMD_R5 = {
+    3: +0.0245, 4: +0.0606, 5: +0.0589, 6: +0.0385, 7: +0.0358,
+    8: +0.0106, 9: +0.0007, 10: +0.0245, 11: +0.0138, 12: +0.0116,
+    13: +0.0094, 14: +0.0041, 15: +0.0003, 16: -0.0029, 17: -0.0037,
+    18: -0.0011, 19: -0.0091, 20: -0.0094, 21: -0.0078, 22: -0.0029,
+    23: -0.0020, 24: -0.0008, 25: +0.0008, 26: +0.0056, 27: +0.0094,
+    28: +0.0107, 29: +0.0058, 30: +0.0057, 31: +0.0097, 32: +0.0080,
+    33: +0.0116, 34: +0.0144, 35: +0.0145, 36: +0.0142, 37: +0.0135,
+    38: +0.0144, 39: +0.0133, 40: +0.0133, 41: +0.0118, 42: +0.0114,
+    43: +0.0133, 44: +0.0140, 45: +0.0129, 46: +0.0127, 47: +0.0146,
+    48: +0.0158, 49: +0.0159, 50: +0.0138,
+}
+
+BL_R5 = {
+    3: -0.1549, 4: -0.1183, 5: -0.0761, 6: -0.0454, 7: -0.0276,
+    8: -0.0027, 9: -0.0096, 10: +0.0004, 11: +0.0189, 12: +0.0060,
+    13: +0.0004, 14: +0.0076, 15: +0.0036, 16: +0.0119, 17: -0.0020,
+    18: -0.0046, 19: -0.0043, 20: +0.0014, 21: -0.0014, 22: +0.0017,
+    23: +0.0061, 24: +0.0118, 25: +0.0166, 26: +0.0118, 27: +0.0115,
+    28: +0.0119, 29: +0.0110, 30: +0.0161, 31: +0.0200, 32: +0.0260,
+    33: +0.0200, 34: +0.0138, 35: +0.0147, 36: +0.0144, 37: +0.0127,
+    38: +0.0099, 39: +0.0094, 40: +0.0164, 41: +0.0158, 42: +0.0208,
+    43: +0.0168, 44: +0.0150, 45: +0.0165, 46: +0.0172, 47: +0.0163,
+    48: +0.0154, 49: +0.0143, 50: +0.0120,
+}
+
+# ── 主函数 ───────────────────────────────────────────────────────────────────
 
 def plot(output: str | None = None):
-    ks = sorted(MMD_DATA.keys())
-    mmd_vals = [MMD_DATA[k] for k in ks]
-    bl_vals  = [BASELINE_DATA[k] for k in ks]
+    ks = sorted(MMD_R4.keys())
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(11, 5))
 
-    # 两条折线
-    ax.plot(ks, mmd_vals,  color="#2563EB", linewidth=2,   label="STATE+MMD",  zorder=3)
-    ax.plot(ks, bl_vals,   color="#EA580C", linewidth=2,   label="Baseline",   zorder=3)
+    # run4: 实线；run5: 虚线
+    ax.plot(ks, [MMD_R4[k] for k in ks], color="#2563EB", lw=2,   ls="-",  label="STATE+MMD  run4", zorder=3)
+    ax.plot(ks, [BL_R4[k]  for k in ks], color="#EA580C", lw=2,   ls="-",  label="Baseline    run4", zorder=3)
+    ax.plot(ks, [MMD_R5[k] for k in ks], color="#2563EB", lw=1.5, ls="--", label="STATE+MMD  run5", zorder=3, alpha=0.7)
+    ax.plot(ks, [BL_R5[k]  for k in ks], color="#EA580C", lw=1.5, ls="--", label="Baseline    run5", zorder=3, alpha=0.7)
 
     # y=0 参考线
-    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5, zorder=1)
+    ax.axhline(0, color="black", lw=0.8, ls="--", alpha=0.5)
 
-    # ── 三阶段背景色 ──
-    ax.axvspan(3,  5.5, alpha=0.08, color="#2563EB", zorder=0)   # 信号峰
-    ax.axvspan(5.5, 15.5, alpha=0.05, color="gray",  zorder=0)   # 衰减区
-    ax.axvspan(15.5, 50,  alpha=0.06, color="#16A34A", zorder=0) # 平台区
-
-    # phase labels
-    ax.text(4.2,  0.125, "Signal peak\n  k=3~5",   fontsize=9, color="#1D4ED8", ha="center", va="bottom")
-    ax.text(10.5, 0.125, "Decay\nk=6~15",           fontsize=9, color="#555",    ha="center", va="bottom")
-    ax.text(33,   0.110, "Plateau  k=16~50",        fontsize=9, color="#15803D", ha="center", va="bottom")
-
-    # k=3 callout
+    # k=3 两次运行对比标注
     ax.annotate(
-        "k=3\nMMD  = +0.114\nBase = -0.019",
-        xy=(3, MMD_DATA[3]),
-        xytext=(7, 0.105),
-        fontsize=8,
+        "k=3\nrun4: MMD+0.114 / Base-0.019\nrun5: MMD+0.025 / Base-0.155",
+        xy=(3, MMD_R4[3]),
+        xytext=(8, 0.10),
+        fontsize=7.5,
         color="#1D4ED8",
-        arrowprops=dict(arrowstyle="->", color="#1D4ED8", lw=1.2),
+        arrowprops=dict(arrowstyle="->", color="#1D4ED8", lw=1.1),
         bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2563EB", lw=1),
     )
 
     ax.set_xlabel("k  (top-k genes by |Wilcoxon score|)", fontsize=11)
     ax.set_ylabel("Mean Pearson r (PCC)", fontsize=11)
-    ax.set_title("Top-k PCC curve  (run4, HepG2 zero-shot, 67 perturbations)", fontsize=12)
+    ax.set_title("Top-k PCC curve  (run4 vs run5, HepG2 zero-shot, 67 perturbations)", fontsize=11)
     ax.set_xlim(2, 51)
     ax.set_xticks([3, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50])
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=9, ncol=2)
     ax.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
